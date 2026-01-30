@@ -3,6 +3,24 @@ import { WebSocketProvider, getAddress, Interface } from "ethers";
 import { getTokenMetaCached } from "./tokenMeta.js";
 import { sendTelegram } from "./telegram.js";
 import { toTopicAddress, includesKey } from "./utils.js";
+import http from "http";
+
+// Fly зазвичай дає PORT=8080
+const PORT = process.env.PORT ? Number(process.env.PORT) : 8080;
+
+// Простий health endpoint, щоб Fly міг перевіряти що процес живий
+http
+  .createServer((req, res) => {
+    if (req.url === "/health") {
+      res.writeHead(200, { "content-type": "text/plain" });
+      return res.end("ok");
+    }
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end("tge-key-tracker running");
+  })
+  .listen(PORT, "0.0.0.0", () => {
+    console.log(`Health server listening on 0.0.0.0:${PORT}`);
+  });
 
 dotenv.config();
 
