@@ -1,14 +1,14 @@
 FROM node:20-alpine
 WORKDIR /usr/src/app
 
-# беремо package.json саме з fly_ws_tracker
-COPY fly_ws_tracker/package.json ./package.json
+# беремо package.json саме з crypto-tge-key-tracke
+COPY crypto-tge-key-tracke/package.json ./package.json
 # якщо маєш lock файл — краще теж копіювати
-COPY fly_ws_tracker/package-lock.json* ./
+COPY crypto-tge-key-tracke/package-lock.json* ./
 
 RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi
 
 # копіюємо код воркера
-COPY fly_ws_tracker/src ./src
+COPY crypto-tge-key-tracke/src ./src
 
 CMD ["npm", "start"]
