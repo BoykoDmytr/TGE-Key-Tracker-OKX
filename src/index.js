@@ -14,7 +14,7 @@ const WS_ENDPOINT =
   process.env.WS_ENDPOINT ||
   (NODEREAL_API_KEY ? `wss://bsc-ws-node.nodereal.io/ws/v1/${NODEREAL_API_KEY}` : null);
 
-const WATCH_ADDRESSES_RAW = process.env.WATCH_ADDRESSES; // "0xabc...,0xdef..."
+const WATCH_ADDRESSES_RAW = process.env.WATCH_ADDRESS; // "0xabc...,0xdef..."
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
 
