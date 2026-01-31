@@ -1,14 +1,20 @@
 import dotenv from "dotenv";
-import { WebSocketProvider, getAddress, Interface } from "ethers";
-import { getTokenMetaCached } from "./tokenMeta.js";
-import { sendTelegram } from "./telegram.js";
-import { toTopicAddress, includesKey } from "./utils.js";
+dotenv.config();
+
 import http from "http";
+import { Interface, WebSocketProvider, JsonRpcProvider, getAddress } from "ethers";
 
-// Fly зазвичай дає PORT=8080
+import { CHAINS } from "./chains.js";
+import { sendTelegram } from "./telegram.js";
+import { getTokenMetaCached } from "./tokenMeta.js";
+import { toTopicAddress } from "./utils.js";
+
+// --------- Safety logs (щоб бачити причину крашів) ----------
+process.on("uncaughtException", (err) => console.error("UNCAUGHT_EXCEPTION:", err));
+process.on("unhandledRejection", (err) => console.error("UNHANDLED_REJECTION:", err));
+
+// --------- Health server (для Fly smoke checks) -------------
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8080;
-
-// Простий health endpoint, щоб Fly міг перевіряти що процес живий
 http
   .createServer((req, res) => {
     if (req.url === "/health") {
@@ -16,140 +22,206 @@ http
       return res.end("ok");
     }
     res.writeHead(200, { "content-type": "text/plain" });
-    res.end("tge-key-tracker running");
+    res.end("running");
   })
   .listen(PORT, "0.0.0.0", () => {
     console.log(`Health server listening on 0.0.0.0:${PORT}`);
   });
 
-dotenv.config();
-
-/**
- * ENV
- */
-const NODEREAL_API_KEY = process.env.NODEREAL_API_KEY;
-const WS_ENDPOINT =
-  process.env.WS_ENDPOINT ||
-  (NODEREAL_API_KEY ? `wss://bsc-ws-node.nodereal.io/ws/v1/${NODEREAL_API_KEY}` : null);
-
-const WATCH_ADDRESSES_RAW = process.env.WATCH_ADDRESS; // "0xabc...,0xdef..."
+// --------- ENV -------------
+const WATCH_ADDRESSES_RAW = process.env.WATCH_ADDRESSES || process.env.WATCH_ADDRESS;
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
 
-// Опційно: мінімальний amount у raw (в найменших одиницях токена) — антиспам
-const MIN_RAW = process.env.MIN_RAW ? BigInt(process.env.MIN_RAW) : 0n;
+// polling interval for HTTP chains (Base)
+const POLL_MS = process.env.POLL_MS ? Number(process.env.POLL_MS) : 6000;
 
-// Опційно: explorer tx url
-const EXPLORER_TX = process.env.EXPLORER_TX || "https://bscscan.com/tx/";
+function missing(name) {
+  console.error(`Missing env: ${name}`);
+  return true;
+}
 
-if (!WS_ENDPOINT) throw new Error("Missing WS_ENDPOINT or NODEREAL_API_KEY");
-if (!WATCH_ADDRESSES_RAW) throw new Error("Missing WATCH_ADDRESSES (comma-separated list)");
-if (!TG_BOT_TOKEN) throw new Error("Missing TG_BOT_TOKEN");
-if (!TG_CHAT_ID) throw new Error("Missing TG_CHAT_ID");
+let bad = false;
+if (!WATCH_ADDRESSES_RAW) bad = true, missing("WATCH_ADDRESSES (or WATCH_ADDRESS)");
+if (!TG_BOT_TOKEN) bad = true, missing("TG_BOT_TOKEN");
+if (!TG_CHAT_ID) bad = true, missing("TG_CHAT_ID");
 
-/**
- * Normalize watch list
- */
-const WATCH_LIST = WATCH_ADDRESSES_RAW.split(",")
+const enabledChains = CHAINS.filter((c) => !!c.rpc);
+if (enabledChains.length === 0) {
+  bad = true;
+  console.error("No chain RPC endpoints provided. Set WS_ETH / WS_ARB / HTTP_BASE.");
+}
+
+if (bad) {
+  console.error("Env is incomplete. Bot will stay alive (health ok) but will NOT track transfers.");
+  setInterval(() => {}, 1 << 30);
+}
+
+// --------- Watch list normalize ----------
+const WATCH_LIST = WATCH_ADDRESSES_RAW
+  .split(",")
   .map((s) => s.trim())
   .filter(Boolean)
   .map((a) => getAddress(a));
 
 const WATCH_TOPICS = WATCH_LIST.map((a) => toTopicAddress(a));
 
-function log(...args) {
-  console.log(`[${new Date().toISOString()}]`, ...args);
-}
-
-/**
- * Ethers provider (WS)
- */
-const provider = new WebSocketProvider(WS_ENDPOINT);
-
-/**
- * Minimal ERC20 ABI for decoding Transfer
- */
+// --------- ERC20 Transfer event ----------
 const ERC20_ABI = ["event Transfer(address indexed from, address indexed to, uint256 value)"];
 const iface = new Interface(ERC20_ABI);
 const transferTopic = iface.getEvent("Transfer").topicHash;
 
-/**
- * Dedup cache: txHash:logIndex
- */
-const seen = new Set();
+// --------- Start watchers ----------
+console.log("WATCH_ADDRESSES:", WATCH_LIST.join(", "));
+console.log("Enabled chains:", enabledChains.map((c) => `${c.name}(${c.type})`).join(", "));
 
-/**
- * Subscribe:
- *  - topic0 = Transfer
- *  - topic2 (indexed to) = one of WATCH_TOPICS (OR)
- *
- * Це суперефективно: ми НЕ слухаємо весь блокчейн, а тільки transfers на твої адреси.
- */
-const filter = {
-  topics: [transferTopic, null, WATCH_TOPICS.length === 1 ? WATCH_TOPICS[0] : WATCH_TOPICS]
-};
+for (const chain of enabledChains) {
+  if (chain.type === "ws") startWsWatcher(chain);
+  else startHttpPollingWatcher(chain);
+}
 
-log("Starting KEY-like token tracker…");
-log("WS_ENDPOINT:", WS_ENDPOINT);
-log("WATCH_ADDRESSES:", WATCH_LIST.join(", "));
+// ---------------- WS watcher ----------------
+function startWsWatcher(chain) {
+  console.log(`[${chain.name}] WS endpoint: ${chain.rpc}`);
+  const provider = new WebSocketProvider(chain.rpc);
 
-provider.on(filter, async (logEvent) => {
-  try {
+  const seen = new Set(); // txHash:logIndex (per chain)
+
+  const filter = {
+    topics: [transferTopic, null, WATCH_TOPICS.length === 1 ? WATCH_TOPICS[0] : WATCH_TOPICS],
+  };
+
+  provider.on(filter, async (logEvent) => {
     const dedupeKey = `${logEvent.transactionHash}:${logEvent.index}`;
     if (seen.has(dedupeKey)) return;
     seen.add(dedupeKey);
 
-    const parsed = iface.parseLog({ topics: logEvent.topics, data: logEvent.data });
-    if (!parsed || parsed.name !== "Transfer") return;
+    try {
+      const parsed = iface.parseLog({ topics: logEvent.topics, data: logEvent.data });
+      const from = getAddress(parsed.args.from);
+      const to = getAddress(parsed.args.to);
+      const value = BigInt(parsed.args.value.toString());
 
-    const from = getAddress(parsed.args.from);
-    const to = getAddress(parsed.args.to);
-    const value = BigInt(parsed.args.value.toString());
+      // only incoming to our watch list
+      if (!WATCH_LIST.includes(to)) return;
 
-    // safety
-    if (!WATCH_LIST.includes(to)) return;
-    if (value < MIN_RAW) return;
+      const tokenAddress = getAddress(logEvent.address);
+      const meta = await getTokenMetaCached(provider, tokenAddress);
 
-    const tokenAddress = getAddress(logEvent.address);
+      const amountHuman =
+        meta.decimals != null ? formatUnitsBigInt(value, meta.decimals) : value.toString();
 
-    // Fetch & cache token meta (symbol/name/decimals) ONCE per token contract
-    const meta = await getTokenMetaCached(provider, tokenAddress);
+      const txUrl = `${chain.explorerTx}${logEvent.transactionHash}`;
 
-    // Check KEY substring in symbol or name (case-insensitive)
-    const isKeyLike = includesKey(meta.symbol) || includesKey(meta.name);
-    if (!isKeyLike) return;
+      const msg =
+        `📥 Incoming ERC-20 Transfer\n` +
+        `Chain: ${chain.name}\n` +
+        `Token: ${meta.symbol || "?"} (${meta.name || "?"})\n` +
+        `TokenContract: ${tokenAddress}\n` +
+        `To: ${to}\n` +
+        `From: ${from}\n` +
+        `Amount: ${amountHuman} ${meta.symbol || ""}\n` +
+        `Tx: ${txUrl}`;
 
-    // Pretty amount
-    const amountHuman = meta.decimals != null
-      ? formatUnitsBigInt(value, meta.decimals)
-      : value.toString();
+      await sendTelegram({ botToken: TG_BOT_TOKEN, chatId: TG_CHAT_ID, text: msg });
+      console.log(`[${chain.name}] Sent Telegram: ${logEvent.transactionHash}`);
+    } catch (e) {
+      console.error(`[${chain.name}] handler error:`, e?.message || e);
+    }
+  });
 
-    const txUrl = `${EXPLORER_TX}${logEvent.transactionHash}`;
+  provider._websocket?.on?.("open", () => console.log(`[${chain.name}] WebSocket OPEN`));
+  provider._websocket?.on?.("close", (c) => console.log(`[${chain.name}] WebSocket CLOSE`, c));
+  provider._websocket?.on?.("error", (e) =>
+    console.log(`[${chain.name}] WebSocket ERROR`, e?.message || e)
+  );
+}
 
-    const msg =
-      `🔑 KEY-like token received\n` +
-      `Token: ${meta.symbol || "?"} (${meta.name || "?"})\n` +
-      `Contract: ${tokenAddress}\n` +
-      `To: ${to}\n` +
-      `From: ${from}\n` +
-      `Amount: ${amountHuman} ${meta.symbol || ""}\n` +
-      `Tx: ${txUrl}`;
+// ---------------- HTTP polling watcher (Base) ----------------
+// NodeReal Base docs show HTTPS endpoint format; WS not shown -> polling via getBlockNumber + getLogs. :contentReference[oaicite:1]{index=1}
+function startHttpPollingWatcher(chain) {
+  console.log(`[${chain.name}] HTTP endpoint: ${chain.rpc} (polling every ~${POLL_MS}ms)`);
+  const provider = new JsonRpcProvider(chain.rpc);
 
-    await sendTelegram({ botToken: TG_BOT_TOKEN, chatId: TG_CHAT_ID, text: msg });
-    log("Sent Telegram:", msg);
-  } catch (e) {
-    log("Handler error:", e?.message || e);
-  }
-});
+  const seen = new Set(); // txHash:logIndex
+  let lastBlock = null;
 
-// WS lifecycle logs
-provider._websocket?.on?.("open", () => log("WebSocket OPEN"));
-provider._websocket?.on?.("close", (c) => log("WebSocket CLOSE", c));
-provider._websocket?.on?.("error", (e) => log("WebSocket ERROR", e?.message || e));
+  const baseFilter = {
+    topics: [transferTopic, null, WATCH_TOPICS.length === 1 ? WATCH_TOPICS[0] : WATCH_TOPICS],
+  };
 
-/**
- * Simple bigint formatter to decimal string (no float errors)
- */
+  const tick = async () => {
+    try {
+      const current = await provider.getBlockNumber();
+      if (lastBlock == null) {
+        lastBlock = current;
+        console.log(`[${chain.name}] start from block ${lastBlock}`);
+        return;
+      }
+
+      if (current <= lastBlock) return;
+
+      // scan only new blocks
+      const fromBlock = lastBlock + 1;
+      const toBlock = current;
+
+      // chunk if large (safety)
+      const CHUNK = 2000;
+      for (let b = fromBlock; b <= toBlock; b += CHUNK) {
+        const end = Math.min(b + CHUNK - 1, toBlock);
+        const logs = await provider.getLogs({ ...baseFilter, fromBlock: b, toBlock: end });
+
+        for (const logEvent of logs) {
+          const dedupeKey = `${logEvent.transactionHash}:${logEvent.index}`;
+          if (seen.has(dedupeKey)) continue;
+          seen.add(dedupeKey);
+
+          try {
+            const parsed = iface.parseLog({ topics: logEvent.topics, data: logEvent.data });
+            const from = getAddress(parsed.args.from);
+            const to = getAddress(parsed.args.to);
+            const value = BigInt(parsed.args.value.toString());
+            if (!WATCH_LIST.includes(to)) continue;
+
+            const tokenAddress = getAddress(logEvent.address);
+            const meta = await getTokenMetaCached(provider, tokenAddress);
+
+            const amountHuman =
+              meta.decimals != null ? formatUnitsBigInt(value, meta.decimals) : value.toString();
+
+            const txUrl = `${chain.explorerTx}${logEvent.transactionHash}`;
+
+            const msg =
+              `📥 Incoming ERC-20 Transfer\n` +
+              `Chain: ${chain.name}\n` +
+              `Token: ${meta.symbol || "?"} (${meta.name || "?"})\n` +
+              `TokenContract: ${tokenAddress}\n` +
+              `To: ${to}\n` +
+              `From: ${from}\n` +
+              `Amount: ${amountHuman} ${meta.symbol || ""}\n` +
+              `Tx: ${txUrl}`;
+
+            await sendTelegram({ botToken: TG_BOT_TOKEN, chatId: TG_CHAT_ID, text: msg });
+            console.log(`[${chain.name}] Sent Telegram: ${logEvent.transactionHash}`);
+          } catch (e) {
+            console.error(`[${chain.name}] parse/send error:`, e?.message || e);
+          }
+        }
+      }
+
+      lastBlock = current;
+    } catch (e) {
+      console.error(`[${chain.name}] polling tick error:`, e?.message || e);
+    }
+  };
+
+  // run periodically
+  setInterval(tick, POLL_MS);
+  // and run immediately once
+  tick();
+}
+
+// --------- helpers ----------
 function formatUnitsBigInt(value, decimals) {
   const s = value.toString();
   if (decimals === 0) return s;
