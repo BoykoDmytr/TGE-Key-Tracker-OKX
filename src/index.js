@@ -116,8 +116,8 @@ provider.on(filter, async (logEvent) => {
     const meta = await getTokenMetaCached(provider, tokenAddress);
 
     // Check KEY substring in symbol or name (case-insensitive)
-    const isKeyLike = includesKey(meta.symbol) || includesKey(meta.name);
-    if (!isKeyLike) return;
+    //const isKeyLike = includesKey(meta.symbol) || includesKey(meta.name);
+    //if (!isKeyLike) return;
 
     // Pretty amount
     const amountHuman = meta.decimals != null
