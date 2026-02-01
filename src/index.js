@@ -33,12 +33,10 @@ const TG_CHAT_ID = process.env.TG_CHAT_ID;
 
 const POLL_MS = process.env.POLL_MS ? Number(process.env.POLL_MS) : 15000;
 
-// rate limit: X повідомлень/хв
 const RATE_LIMIT_PER_MIN = process.env.RATE_LIMIT_PER_MIN
   ? Number(process.env.RATE_LIMIT_PER_MIN)
   : 20;
 
-// Factory contract (interacted with / tx.to)
 const FACTORY_CONTRACT = getAddress(
   process.env.FACTORY_CONTRACT || "0x000310fa98e36191ec79de241d72c6ca093eafd3"
 );
@@ -54,8 +52,8 @@ if (!TG_CHAT_ID) (bad = true), missing("TG_CHAT_ID");
 
 const enabledChainsAll = CHAINS.filter((c) => !!c.rpc);
 
-// Optional: allow selecting only specific chains by key (comma-separated)
-const ACTIVE_CHAINS_RAW = process.env.ACTIVE_CHAINS; // e.g. "bsc_testnet" or "bsc"
+// Optional: choose chains by key (comma-separated), e.g. "bsc_testnet" or "bsc"
+const ACTIVE_CHAINS_RAW = process.env.ACTIVE_CHAINS;
 const ACTIVE_KEYS = ACTIVE_CHAINS_RAW
   ? new Set(ACTIVE_CHAINS_RAW.split(",").map((s) => s.trim()).filter(Boolean))
   : null;
@@ -64,13 +62,9 @@ const enabledChains = ACTIVE_KEYS
   ? enabledChainsAll.filter((c) => ACTIVE_KEYS.has(c.key))
   : enabledChainsAll;
 
-if (ACTIVE_KEYS) {
-  console.log("ACTIVE_CHAINS:", [...ACTIVE_KEYS].join(", "));
-}
-
 if (enabledChains.length === 0) {
   bad = true;
-  console.error("No chain RPC endpoints provided. Check CHAINS.js and your env RPC vars.");
+  console.error("No enabled chains. Check CHAINS.js and your env RPC vars / ACTIVE_CHAINS.");
 }
 
 if (bad) {
@@ -84,6 +78,7 @@ const iface = new Interface(ERC20_ABI);
 const transferTopic = iface.getEvent("Transfer").topicHash;
 
 // --------- Start watchers ----------
+if (ACTIVE_KEYS) console.log("ACTIVE_CHAINS:", [...ACTIVE_KEYS].join(", "));
 console.log("Enabled chains:", enabledChains.map((c) => `${c.name}(${c.type})`).join(", "));
 console.log("FACTORY_CONTRACT:", FACTORY_CONTRACT);
 console.log(`POLL_MS ~${POLL_MS}ms, rate limit: ${RATE_LIMIT_PER_MIN}/min`);
