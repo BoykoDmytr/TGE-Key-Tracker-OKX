@@ -5,5 +5,6 @@ export const CHAINS = [
   { key:"base", name:"Base", type:"http", rpc: process.env.HTTP_BASE_RPC, explorerTx:"https://basescan.org/tx/" },
 
   // ✅ додай це
+  { key:"bsc_testnet", name:"BSC Testnet", type:"ws", rpc: process.env.WS_BSC_TESTNET, explorerTx:"https://testnet.bscscan.com/tx/" },
   { key:"bsc", name:"BSC", type:"http", rpc: process.env.HTTP_BSC_RPC, explorerTx:"https://bscscan.com/tx/" },
 ];

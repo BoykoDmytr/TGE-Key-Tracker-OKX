@@ -2,7 +2,7 @@ import dotenv from "dotenv";
 dotenv.config();
 
 import http from "http";
-import { Interface, JsonRpcProvider, getAddress } from "ethers";
+import { Interface, JsonRpcProvider, WebSocketProvider, getAddress } from "ethers";
 
 import { CHAINS } from "./chains.js";
 import { sendTelegram } from "./telegram.js";
@@ -12,7 +12,7 @@ import { getTokenMetaCached } from "./tokenMeta.js";
 process.on("uncaughtException", (err) => console.error("UNCAUGHT_EXCEPTION:", err));
 process.on("unhandledRejection", (err) => console.error("UNHANDLED_REJECTION:", err));
 
-// --------- Health server (Fly smoke checks) ----------
+// --------- Health server ----------
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8080;
 http
   .createServer((req, res) => {
@@ -52,7 +52,22 @@ let bad = false;
 if (!TG_BOT_TOKEN) (bad = true), missing("TG_BOT_TOKEN");
 if (!TG_CHAT_ID) (bad = true), missing("TG_CHAT_ID");
 
-const enabledChains = CHAINS.filter((c) => !!c.rpc);
+const enabledChainsAll = CHAINS.filter((c) => !!c.rpc);
+
+// Optional: allow selecting only specific chains by key (comma-separated)
+const ACTIVE_CHAINS_RAW = process.env.ACTIVE_CHAINS; // e.g. "bsc_testnet" or "bsc"
+const ACTIVE_KEYS = ACTIVE_CHAINS_RAW
+  ? new Set(ACTIVE_CHAINS_RAW.split(",").map((s) => s.trim()).filter(Boolean))
+  : null;
+
+const enabledChains = ACTIVE_KEYS
+  ? enabledChainsAll.filter((c) => ACTIVE_KEYS.has(c.key))
+  : enabledChainsAll;
+
+if (ACTIVE_KEYS) {
+  console.log("ACTIVE_CHAINS:", [...ACTIVE_KEYS].join(", "));
+}
+
 if (enabledChains.length === 0) {
   bad = true;
   console.error("No chain RPC endpoints provided. Check CHAINS.js and your env RPC vars.");
@@ -68,32 +83,113 @@ const ERC20_ABI = ["event Transfer(address indexed from, address indexed to, uin
 const iface = new Interface(ERC20_ABI);
 const transferTopic = iface.getEvent("Transfer").topicHash;
 
-// --------- Start watcher (BSC only) ----------
+// --------- Start watchers ----------
 console.log("Enabled chains:", enabledChains.map((c) => `${c.name}(${c.type})`).join(", "));
 console.log("FACTORY_CONTRACT:", FACTORY_CONTRACT);
-console.log(`Polling every ~${POLL_MS}ms, rate limit: ${RATE_LIMIT_PER_MIN}/min`);
+console.log(`POLL_MS ~${POLL_MS}ms, rate limit: ${RATE_LIMIT_PER_MIN}/min`);
 
-// шукаємо BSC chain
-const bscChain =
-  enabledChains.find((c) => c.key === "bsc") ||
-  enabledChains.find((c) => (c.name || "").toLowerCase() === "bsc");
-
-if (!bscChain) {
-  console.error("BSC chain is not enabled in CHAINS.js (key:'bsc') or missing HTTP_BSC_RPC env.");
-  setInterval(() => {}, 1 << 30);
-} else {
-  startFactoryInteractionWatcher(bscChain);
+for (const chain of enabledChains) {
+  if (chain.type === "ws") startWsFactoryWatcher(chain);
+  else startHttpFactoryWatcher(chain);
 }
 
-// ---------------- Factory interaction watcher (polling) ----------------
-function startFactoryInteractionWatcher(chain) {
+// ---------------- WS watcher (block-based) ----------------
+function startWsFactoryWatcher(chain) {
+  console.log(`[${chain.name}] WS endpoint: ${chain.rpc}`);
+  const provider = new WebSocketProvider(chain.rpc);
+
+  const seenTx = new Set();
+
+  // rate limit (sliding window)
+  let sentTimestamps = [];
+  const canSend = () => {
+    const now = Date.now();
+    sentTimestamps = sentTimestamps.filter((t) => now - t < 60_000);
+    return sentTimestamps.length < RATE_LIMIT_PER_MIN;
+  };
+  const markSent = () => sentTimestamps.push(Date.now());
+
+  provider.on("block", async (blockNumber) => {
+    try {
+      const block = await provider.getBlock(blockNumber, true);
+      if (!block?.transactions?.length) return;
+
+      const ts = Number(block.timestamp);
+
+      for (const tx of block.transactions) {
+        if (!tx?.to) continue;
+
+        let toAddr;
+        try {
+          toAddr = getAddress(tx.to);
+        } catch {
+          continue;
+        }
+        if (toAddr !== FACTORY_CONTRACT) continue;
+
+        const txHash = tx.hash;
+        if (!txHash || seenTx.has(txHash)) continue;
+
+        const receipt = await provider.getTransactionReceipt(txHash);
+        if (!receipt?.logs?.length) {
+          seenTx.add(txHash);
+          continue;
+        }
+
+        const transfersAll = parseTransferLogs(receipt.logs);
+        if (transfersAll.length === 0) {
+          seenTx.add(txHash);
+          continue;
+        }
+
+        for (const t of transfersAll) {
+          const meta = await getTokenMetaCached(provider, t.tokenContract);
+          t.meta = meta || { address: t.tokenContract, symbol: null, name: null, decimals: null };
+        }
+
+        if (!canSend()) {
+          console.log(`[${chain.name}] rate limit reached, skipping tx ${txHash}`);
+          seenTx.add(txHash);
+          continue;
+        }
+
+        const msg = formatTelegramMessage({
+          chain,
+          txHash,
+          sender: getAddress(tx.from),
+          interactedWith: FACTORY_CONTRACT,
+          blockNumber: Number(receipt.blockNumber),
+          timestamp: ts,
+          transfers: transfersAll,
+        });
+
+        await sendTelegram({ botToken: TG_BOT_TOKEN, chatId: TG_CHAT_ID, text: msg });
+        markSent();
+        seenTx.add(txHash);
+
+        console.log(`[${chain.name}] Sent Telegram for factory tx: ${txHash}`);
+      }
+    } catch (e) {
+      console.error(`[${chain.name}] ws block handler error:`, e?.message || e);
+    }
+  });
+
+  provider._websocket?.on?.("open", () => console.log(`[${chain.name}] WebSocket OPEN`));
+  provider._websocket?.on?.("close", (c) => console.log(`[${chain.name}] WebSocket CLOSE`, c));
+  provider._websocket?.on?.("error", (e) =>
+    console.log(`[${chain.name}] WebSocket ERROR`, e?.message || e)
+  );
+}
+
+// ---------------- HTTP watcher (polling blocks) ----------------
+function startHttpFactoryWatcher(chain) {
   console.log(`[${chain.name}] HTTP endpoint: ${chain.rpc} (factory tx polling)`);
   const provider = new JsonRpcProvider(chain.rpc);
 
-  const seenTx = new Set(); // txHash dedupe
+  const seenTx = new Set();
   let lastBlock = null;
 
-  // Sliding-window rate limiter
+  // rate limit (sliding window)
   let sentTimestamps = [];
   const canSend = () => {
     const now = Date.now();
@@ -129,8 +225,6 @@ function startFactoryInteractionWatcher(chain) {
           } catch {
             continue;
           }
-
-          // ✅ trigger on any tx where tx.to == FACTORY_CONTRACT
           if (toAddr !== FACTORY_CONTRACT) continue;
 
           const txHash = tx.hash;
@@ -142,16 +236,12 @@ function startFactoryInteractionWatcher(chain) {
             continue;
           }
 
-          // ✅ parse ALL ERC-20 Transfer logs in this tx (no WATCH filtering)
           const transfersAll = parseTransferLogs(receipt.logs);
-
-          // якщо взагалі нема Transfer логів — можна не надсилати
           if (transfersAll.length === 0) {
             seenTx.add(txHash);
             continue;
           }
 
-          // fetch token meta for each transfer
           for (const t of transfersAll) {
             const meta = await getTokenMetaCached(provider, t.tokenContract);
             t.meta = meta || { address: t.tokenContract, symbol: null, name: null, decimals: null };
@@ -159,7 +249,6 @@ function startFactoryInteractionWatcher(chain) {
 
           if (!canSend()) {
             console.log(`[${chain.name}] rate limit reached, skipping tx ${txHash}`);
-            // ⚠️ пропускаємо, але щоб не спамити повторно — дедупимо
             seenTx.add(txHash);
             continue;
           }
