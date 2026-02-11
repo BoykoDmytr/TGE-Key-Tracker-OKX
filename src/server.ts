@@ -434,6 +434,19 @@ export async function processTransfers(opts: {
 }
 
 export async function handleWebhook(raw: Buffer, headers: Record<string, any>, payload: any) {
+  // Moralis "verify webhook" інколи робить POST без підпису.
+  // Щоб пройти їхню перевірку 200 — відповідаємо OK, але НЕ процесимо нічого.
+  const overrideHeader = process.env.MORALIS_SIGNATURE_HEADER;
+  const sig =
+    (overrideHeader ? headerValue(headers, overrideHeader) : null) ||
+    headerValue(headers, "x-signature") ||
+    headerValue(headers, "x-moralis-signature") ||
+    headerValue(headers, "x-webhook-signature");
+
+  if (!sig) {
+    logger.info({ note: "moralis_verify_no_signature" }, "Webhook verify ping (no signature) -> 200");
+    return { ok: true, verify: true };
+  }
   verifyMoralisSignature(raw, headers);
 
   const { chainSlug } = normalizeChainSlug(payload);
