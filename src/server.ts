@@ -537,6 +537,7 @@ export function buildServer() {
   });
 
   app.get("/health", async () => ({ ok: true }));
+  app.get("/webhooks/moralis", async () => ({ ok: true, method: "GET", hint: "Use POST for webhooks" }));
 
   app.post(
   "/webhooks/moralis",
