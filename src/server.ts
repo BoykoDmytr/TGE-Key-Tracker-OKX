@@ -1,610 +1,159 @@
-import Fastify from "fastify";
-import Pino from "pino";
-import { createHmac, timingSafeEqual } from "crypto";
-import { ethers } from "ethers";
-import IORedis from "ioredis";
-import { sendTelegram } from "./telegram";
+// src/server.ts
+import 'dotenv/config';
+import express, { Request, Response } from 'express';
+import pinoHttp from 'pino-http';
 
-/**
- * ENV
- * - MORALIS_WEBHOOK_SECRET (required)
- * - INTERACTION_CONTRACT (required)
- * - CHAINS (optional, comma-separated: base,arbitrum,optimism,eth,bsc)
- * - THRESHOLDS_JSON (required for actual alerts; strict mode ignores others)
- * - REDIS_URL (optional)
- * - RPC_URLS_JSON (optional; only needed when Moralis doesn't provide tokenSymbol/decimals)
- * - MORALIS_SIGNATURE_HEADER (optional; default tries x-signature then x-moralis-signature)
- * - DEDUPE_TTL_SECONDS (optional; default 604800 (7d))
- * - PORT (optional)
- */
+import { verifyTenderlySignature } from './tenderly/verify';
+import { extractTransfersFromReceipt } from './tenderly/parseTransfers';
 
-const logger = Pino({ level: process.env.LOG_LEVEL || "info" });
-const STRICT_MODE = (process.env.STRICT_MODE || "false").toLowerCase() === "true";
-const DEFAULT_THRESHOLD = Number(process.env.DEFAULT_THRESHOLD || "0");
-const INTERACTION_CONTRACT = (process.env.INTERACTION_CONTRACT || "").toLowerCase();
-const MORALIS_WEBHOOK_SECRET = process.env.MORALIS_WEBHOOK_SECRET || "";
-const CHAINS_ALLOWED = new Set(
-  (process.env.CHAINS || "eth,base,arbitrum,optimism,bsc")
-    .split(",")
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean)
-);
+import { getPublicClient, type ChainKey, getExplorerTxUrl } from './evm/provider';
+import { getErc20MetaCached, formatUnitsSafe } from './evm/erc20MetaCache';
 
-const DEDUPE_TTL_SECONDS = Number(process.env.DEDUPE_TTL_SECONDS || "604800");
+import { isDuplicate, markDuplicate } from './dedupe';
+import { sendTelegram } from './telegram';
 
-type Thresholds = Record<string, number>; // key: tokenAddr(lowercase) OR symbol(uppercase) => thresholdHuman
-function parseThresholds(): Thresholds {
-  const raw = process.env.THRESHOLDS_JSON || "{}";
+const app = express();
+app.use(pinoHttp());
+
+// Tenderly вимагає raw body для signature verification
+app.post('/webhooks/tenderly', express.raw({ type: 'application/json' }), async (req: Request, res: Response) => {
   try {
-    const obj = JSON.parse(raw) as Record<string, number>;
-    const out: Thresholds = {};
-    for (const [k, v] of Object.entries(obj)) {
-      if (typeof v !== "number" || !Number.isFinite(v) || v < 0) continue;
-      const key = k.startsWith("0x") && k.length === 42 ? k.toLowerCase() : k.toUpperCase();
-      out[key] = v;
-    }
-    return out;
-  } catch {
-    return {};
-  }
-}
+    const signingKey = process.env.TENDERLY_SIGNING_KEY || '';
+    if (!signingKey) return res.status(500).send('Missing TENDERLY_SIGNING_KEY');
 
-type RpcUrls = Record<string, string>; // chainSlug => rpc url
-function parseRpcUrls(): RpcUrls {
-  const raw = process.env.RPC_URLS_JSON || "{}";
-  try {
-    const obj = JSON.parse(raw) as Record<string, string>;
-    const out: RpcUrls = {};
-    for (const [k, v] of Object.entries(obj)) {
-      if (typeof v === "string" && v.startsWith("http")) out[k.toLowerCase()] = v;
-    }
-    return out;
-  } catch {
-    return {};
-  }
-}
+    const signature = (req.header('x-tenderly-signature') || '').trim();
+    const date = (req.header('date') || '').trim();
 
-const thresholds = parseThresholds();
-const rpcUrls = parseRpcUrls();
-
-if (!INTERACTION_CONTRACT) {
-  logger.warn("INTERACTION_CONTRACT is missing (env). Webhook will reject candidates.");
-}
-if (!MORALIS_WEBHOOK_SECRET) {
-  logger.warn("MORALIS_WEBHOOK_SECRET is missing (env). Signature verification will fail.");
-}
-
-// ---------- Chain helpers ----------
-
-const chainIdToSlug: Record<string, string> = {
-  "0x1": "eth",
-  "1": "eth",
-  "0x2105": "base",
-  "8453": "base",
-  "0xa4b1": "arbitrum",
-  "42161": "arbitrum",
-  "0xa": "optimism",
-  "10": "optimism",
-  "0x38": "bsc",
-  "56": "bsc"
-};
-
-function normalizeChainSlug(payload: any): { chainSlug: string; chainId?: string } {
-  const chainIdRaw = payload?.chainId ?? payload?.chain?.id ?? payload?.chain_id;
-  const chainNameRaw = payload?.chain ?? payload?.chainName ?? payload?.chain_name;
-
-  if (chainIdRaw !== undefined && chainIdRaw !== null) {
-    const idStr = String(chainIdRaw);
-    const slug = chainIdToSlug[idStr] || chainIdToSlug[idStr.toLowerCase()];
-    if (slug) return { chainSlug: slug, chainId: idStr };
-  }
-
-  if (typeof chainNameRaw === "string") {
-    const s = chainNameRaw.toLowerCase();
-    if (CHAINS_ALLOWED.has(s)) return { chainSlug: s };
-    if (chainIdToSlug[s]) return { chainSlug: chainIdToSlug[s], chainId: s };
-  }
-
-  return { chainSlug: "unknown", chainId: chainIdRaw ? String(chainIdRaw) : undefined };
-}
-
-function explorerTx(chainSlug: string, txHash: string): string {
-  switch (chainSlug) {
-    case "eth":
-      return `https://etherscan.io/tx/${txHash}`;
-    case "base":
-      return `https://basescan.org/tx/${txHash}`;
-    case "arbitrum":
-      return `https://arbiscan.io/tx/${txHash}`;
-    case "optimism":
-      return `https://optimistic.etherscan.io/tx/${txHash}`;
-    case "bsc":
-      return `https://bscscan.com/tx/${txHash}`;
-    default:
-      return txHash;
-  }
-}
-
-// ---------- Dedupe (Redis NX/EX preferred; memory fallback) ----------
-
-class DedupeStore {
-  private mem = new Map<string, number>(); // key -> expiresAtMs
-  private redis?: IORedis;
-
-  constructor(redisUrl?: string) {
-    if (redisUrl) {
-      this.redis = new IORedis(redisUrl);
-      this.redis.on("error", (err: unknown) => logger.error({ err }, "Redis error"));
-      logger.info("Dedupe store: Redis (SET NX EX)");
-    } else {
-      logger.info("Dedupe store: In-memory (fallback)");
-    }
-  }
-
-  async seen(key: string, ttlSeconds: number): Promise<boolean> {
-    const now = Date.now();
-
-    if (this.redis) {
-      const res = await this.redis.set(key, "1", "EX", ttlSeconds, "NX");
-      return res === null; // null => key existed
+    if (!verifyTenderlySignature({ signingKey, signature, date, rawBody: req.body as Buffer })) {
+      req.log.warn({ signature, date }, 'Invalid Tenderly signature');
+      return res.status(400).send('Invalid signature');
     }
 
-    const exp = this.mem.get(key);
-    if (exp && exp > now) return true;
+    const body = JSON.parse((req.body as Buffer).toString('utf8'));
 
-    this.mem.set(key, now + ttlSeconds * 1000);
+    // Tenderly event types
+    const eventType: string = body?.event_type;
+    if (eventType === 'TEST') return res.status(200).send('ok');
+    if (eventType !== 'ALERT') return res.status(200).send('ignored');
 
-    // light cleanup
-    if (this.mem.size > 50000) {
-      for (const [k, v] of this.mem) if (v <= now) this.mem.delete(k);
+    // Витягуємо network + txHash (у різних алертів може бути трохи різна структура)
+    const network: string | undefined =
+      body?.alert?.network || body?.network || body?.data?.network || body?.transaction?.network;
+
+    const txHash: string | undefined =
+      body?.alert?.tx_hash || body?.tx_hash || body?.transaction?.hash || body?.data?.tx_hash;
+
+    if (!network || !txHash) {
+      req.log.warn({ network, txHash }, 'Missing network or txHash in Tenderly payload');
+      return res.status(200).send('ok');
     }
 
-    return false;
-  }
-}
-
-const dedupe = new DedupeStore(process.env.REDIS_URL);
-
-// ---------- Token metadata cache ----------
-
-type TokenMeta = { symbol: string; decimals: number };
-const tokenMetaCache = new Map<string, TokenMeta>(); // key: `${chainSlug}:${tokenAddrLower}`
-
-const ERC20_ABI = ["function symbol() view returns (string)", "function decimals() view returns (uint8)"];
-
-async function getTokenMeta(chainSlug: string, tokenAddress: string): Promise<TokenMeta | null> {
-  const key = `${chainSlug}:${tokenAddress.toLowerCase()}`;
-  if (tokenMetaCache.has(key)) return tokenMetaCache.get(key)!;
-
-  const rpcUrl = rpcUrls[chainSlug];
-  if (!rpcUrl) return null;
-
-  try {
-    const provider = new ethers.JsonRpcProvider(rpcUrl);
-    const c = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
-    const [symbol, decimals] = await Promise.all([c.symbol(), c.decimals()]);
-    const meta: TokenMeta = { symbol: String(symbol), decimals: Number(decimals) };
-    tokenMetaCache.set(key, meta);
-    return meta;
-  } catch (err) {
-    logger.warn({ err, chainSlug, tokenAddress }, "Failed to fetch token meta via RPC");
-    return null;
-  }
-}
-
-// ---------- Retry ----------
-
-async function withRetry<T>(fn: () => Promise<T>, opts: { retries: number; baseMs: number; maxMs: number }): Promise<T> {
-  let attempt = 0;
-  while (true) {
-    try {
-      return await fn();
-    } catch (err) {
-      attempt++;
-      if (attempt > opts.retries) throw err;
-      const delay = Math.min(opts.baseMs * 2 ** (attempt - 1), opts.maxMs);
-      await new Promise((r) => setTimeout(r, delay));
-    }
-  }
-}
-
-// ---------- Transfer parsing ----------
-
-const TRANSFER_TOPIC0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-
-type ParsedTransfer = {
-  txHash: string;
-  logIndex: number;
-  tokenAddress: string;
-  from: string;
-  to: string;
-  valueRaw: string; // decimal string
-  symbol?: string;
-  decimals?: number;
-};
-
-function parseFromMoralisErc20Transfers(payload: any): ParsedTransfer[] {
-  const arr = payload?.erc20Transfers;
-  if (!Array.isArray(arr)) return [];
-
-  const transfers: ParsedTransfer[] = [];
-  for (const t of arr) {
-    const txHash = t?.transactionHash || t?.transaction_hash || t?.txHash || t?.hash;
-    const tokenAddress = (t?.address || t?.tokenAddress || t?.contract || "").toLowerCase();
-    const from = (t?.from || t?.fromAddress || "").toLowerCase();
-    const to = (t?.to || t?.toAddress || "").toLowerCase();
-    const logIndex = Number(t?.logIndex ?? t?.log_index ?? -1);
-    const valueRaw = String(t?.value ?? t?.amount ?? "");
-
-    if (!txHash || !tokenAddress || logIndex < 0 || !from || !to || !valueRaw) continue;
-
-    const symbol = t?.tokenSymbol || t?.symbol;
-    const decimals = t?.tokenDecimals ?? t?.tokenDecimal ?? t?.decimals;
-
-    transfers.push({
-      txHash: String(txHash),
-      logIndex,
-      tokenAddress,
-      from,
-      to,
-      valueRaw,
-      symbol: typeof symbol === "string" ? symbol : undefined,
-      decimals: decimals !== undefined ? Number(decimals) : undefined
-    });
-  }
-  return transfers;
-}
-
-type RawLog = { address: string; topics: string[]; data: string; logIndex?: number; transactionHash?: string };
-
-function collectRawLogs(payload: any): RawLog[] {
-  const logs: RawLog[] = [];
-
-  if (Array.isArray(payload?.logs)) {
-    for (const l of payload.logs) logs.push(l);
-  }
-
-  if (Array.isArray(payload?.txs)) {
-    for (const tx of payload.txs) {
-      if (Array.isArray(tx?.logs)) {
-        for (const l of tx.logs) {
-          logs.push({
-            ...l,
-            transactionHash: l?.transactionHash || l?.transaction_hash || tx?.hash || tx?.transactionHash
-          });
-        }
-      }
-    }
-  }
-
-  return logs
-    .filter((l) => l && typeof l.address === "string" && Array.isArray(l.topics) && typeof l.data === "string")
-    .map((l) => ({
-      address: String(l.address).toLowerCase(),
-      topics: l.topics.map((x: any) => String(x).toLowerCase()),
-      data: String(l.data),
-      logIndex: l.logIndex !== undefined ? Number(l.logIndex) : undefined,
-      transactionHash: l.transactionHash ? String(l.transactionHash) : undefined
-    }));
-}
-
-function parseFromRawLogs(payload: any): ParsedTransfer[] {
-  const logs = collectRawLogs(payload);
-  const out: ParsedTransfer[] = [];
-
-  for (const log of logs) {
-    const topic0 = log.topics?.[0];
-    if (!topic0 || topic0.toLowerCase() !== TRANSFER_TOPIC0) continue;
-
-    const topic1 = log.topics?.[1];
-    const topic2 = log.topics?.[2];
-    if (!topic1 || !topic2) continue;
-
-    const from = ethers.getAddress(`0x${topic1.slice(26)}`).toLowerCase();
-    const to = ethers.getAddress(`0x${topic2.slice(26)}`).toLowerCase();
-
-    let valueRaw = "";
-    try {
-      const v = ethers.toBigInt(log.data);
-      valueRaw = v.toString();
-    } catch {
-      continue;
+    const chainKey = normalizeTenderlyNetwork(network);
+    if (!chainKey) {
+      req.log.warn({ network }, 'Unsupported network');
+      return res.status(200).send('ok');
     }
 
-    const txHash =
-      log.transactionHash || payload?.txs?.[0]?.hash || payload?.transactionHash || payload?.txHash || "";
+    // allowlist chains (optional)
+    const allow = new Set((process.env.CHAINS || '').split(',').map(s => s.trim()).filter(Boolean));
+    if (allow.size && !allow.has(chainKey)) return res.status(200).send('ok');
 
-    const logIndex = log.logIndex ?? -1;
-    if (!txHash || logIndex < 0) continue;
+    const client = getPublicClient(chainKey);
 
-    out.push({
-      txHash: String(txHash),
-      logIndex,
-      tokenAddress: log.address.toLowerCase(),
-      from,
-      to,
-      valueRaw
-    });
-  }
+    // 1) tx.to == INTERACTION_CONTRACT
+    const tx = await client.getTransaction({ hash: txHash as `0x${string}` });
+    const interactionAddr = (process.env.INTERACTION_CONTRACT || '').toLowerCase();
+    if (!interactionAddr) return res.status(500).send('Missing INTERACTION_CONTRACT');
 
-  return out;
-}
-
-function findCandidateInteractionTxHashes(payload: any, interactionContract: string): string[] {
-  const candidates: string[] = [];
-
-  const txs = payload?.txs;
-  if (Array.isArray(txs)) {
-    for (const tx of txs) {
-      const to = (tx?.to || tx?.toAddress || tx?.to_address || "").toLowerCase();
-      const hash = tx?.hash || tx?.transactionHash || tx?.transaction_hash;
-      if (to && hash && to === interactionContract) candidates.push(String(hash));
+    if (!tx.to || tx.to.toLowerCase() !== interactionAddr) {
+      return res.status(200).send('ok');
     }
+
+    // 2) Парсимо ERC20 Transfer з receipt.logs
+    const receipt = await client.getTransactionReceipt({ hash: txHash as `0x${string}` });
+    const transfers = extractTransfersFromReceipt(receipt);
+    if (!transfers.length) return res.status(200).send('ok');
+
+    // Thresholds: {"0xTokenAddr": "1000", "0xToken2": "0.5"}
+    const thresholds: Record<string, string> = safeJson(process.env.THRESHOLDS_JSON || '{}');
+    const thresholdsLower: Record<string, string> = {};
+    for (const [addr, human] of Object.entries(thresholds)) thresholdsLower[addr.toLowerCase()] = String(human);
+
+    // (опціонально) кастомні назви токенів у боті:
+    // {"0xTokenAddr":"MMS (Test)","0xToken2":"USDT"}
+    const tokenLabels: Record<string, string> = safeJson(process.env.TOKEN_LABELS_JSON || '{}');
+    const tokenLabelsLower: Record<string, string> = {};
+    for (const [addr, label] of Object.entries(tokenLabels)) tokenLabelsLower[addr.toLowerCase()] = String(label);
+
+    for (const t of transfers) {
+      const tokenAddrLower = t.token.toLowerCase();
+
+      // strict mode: тільки токени, які є в thresholds
+      const threshHuman = thresholdsLower[tokenAddrLower];
+      if (!threshHuman) continue;
+
+      // dedupe
+      const dedupeKey = `${chainKey}:${txHash}:${t.logIndex}:${tokenAddrLower}:${t.to.toLowerCase()}`;
+      if (await isDuplicate(dedupeKey)) continue;
+
+      // meta token
+      const meta = await getErc20MetaCached(client, t.token);
+      const amountHuman = formatUnitsSafe(t.value, meta.decimals);
+
+      if (!compareHuman(amountHuman, threshHuman)) continue;
+
+      const explorer = getExplorerTxUrl(chainKey, txHash);
+
+      const label = tokenLabelsLower[tokenAddrLower] || meta.symbol;
+
+      const message =
+        `🔔 Interaction + ERC20 Transfer\n` +
+        `Chain: ${chainKey}\n` +
+        `Token: ${label} (${t.token})\n` +
+        `Amount: ${amountHuman}\n` +
+        `From: ${t.from}\n` +
+        `To: ${t.to}\n` +
+        `Interaction: ${tx.to}\n` +
+        `Tx: ${explorer}`;
+
+      await sendTelegram(message);
+
+      await markDuplicate(dedupeKey);
+    }
+
+    return res.status(200).send('ok');
+  } catch (err: any) {
+    (req as any).log?.error?.({ err }, 'Error handling webhook');
+    return res.status(500).send('error');
   }
+});
 
-  const singleTo = (payload?.tx?.to || payload?.to || "").toLowerCase();
-  const singleHash = payload?.tx?.hash || payload?.hash || payload?.txHash;
-  if (singleTo && singleHash && singleTo === interactionContract) candidates.push(String(singleHash));
+app.get('/health', (_req: Request, res: Response) => res.status(200).send('ok'));
 
-  return Array.from(new Set(candidates));
-}
+const port = Number(process.env.PORT || 8080);
+app.listen(port, () => console.log(`Listening on :${port}`));
 
-// ---------- Core processing ----------
-
-function humanAmount(valueRaw: string, decimals: number): string {
-  try {
-    return ethers.formatUnits(valueRaw, decimals);
-  } catch {
-    return "0";
-  }
-}
-
-function thresholdFor(tokenAddressLower: string, symbolMaybe?: string): number | null {
-  const byAddr = thresholds[tokenAddressLower];
-  if (typeof byAddr === "number") return byAddr;
-
-  if (symbolMaybe) {
-    const bySym = thresholds[symbolMaybe.toUpperCase()];
-    if (typeof bySym === "number") return bySym;
-  }
-
-  if (STRICT_MODE) return null;
-
-  if (Number.isFinite(DEFAULT_THRESHOLD) && DEFAULT_THRESHOLD > 0) return DEFAULT_THRESHOLD;
-
+function normalizeTenderlyNetwork(net: string): ChainKey | null {
+  const n = net.toLowerCase();
+  if (n.includes('bsc') && n.includes('test')) return 'bsc_testnet';
+  if (n.includes('bsc') || n.includes('bnb')) return 'bsc';
+  if (n.includes('base')) return 'base';
+  if (n.includes('arbitrum')) return 'arbitrum';
   return null;
 }
 
-
-function toNumberSafe(s: string): number {
-  const n = Number(s);
-  return Number.isFinite(n) ? n : 0;
-}
-
-export async function processTransfers(opts: {
-  chainSlug: string;
-  interactionContract: string;
-  txHash: string;
-  transfers: ParsedTransfer[];
-  timestampSeconds?: number;
-}) {
-  const { chainSlug, interactionContract, txHash } = opts;
-  const timestampSeconds = opts.timestampSeconds ?? Math.floor(Date.now() / 1000);
-
-  for (const t of opts.transfers) {
-    if (t.txHash.toLowerCase() !== txHash.toLowerCase()) continue;
-
-    const tokenAddr = t.tokenAddress.toLowerCase();
-    let symbol = t.symbol;
-    let decimals = t.decimals;
-
-    if (!symbol || decimals === undefined || Number.isNaN(decimals)) {
-      const meta = await getTokenMeta(chainSlug, tokenAddr);
-      if (!meta) continue; // strict skip if can't resolve meta
-      symbol = symbol || meta.symbol;
-      decimals = decimals ?? meta.decimals;
-    }
-
-    const threshold = thresholdFor(tokenAddr, symbol);
-    if (threshold === null) continue;
-
-    const amountHuman = humanAmount(t.valueRaw, decimals!);
-    const amountNum = toNumberSafe(amountHuman);
-    if (amountNum <= threshold) continue;
-
-    const dedupeKey = `dedupe:${chainSlug}:${txHash.toLowerCase()}:${t.logIndex}:${tokenAddr}:${t.to.toLowerCase()}`;
-    const already = await dedupe.seen(dedupeKey, DEDUPE_TTL_SECONDS);
-    if (already) continue;
-
-    const msg =
-      `🔔 ERC-20 Transfer Detected\n` +
-      `Chain: ${chainSlug}\n` +
-      `Token: ${symbol} (${tokenAddr})\n` +
-      `Amount: ${amountHuman}\n` +
-      `From: ${t.from}\n` +
-      `To: ${t.to}\n` +
-      `Tx: ${txHash}\n` +
-      `Explorer: ${explorerTx(chainSlug, txHash)}\n` +
-      `Timestamp: ${new Date(timestampSeconds * 1000).toISOString()}\n` +
-      `Interaction Contract: ${interactionContract}`;
-
-    await withRetry(() => sendTelegram(msg), { retries: 5, baseMs: 500, maxMs: 8000 });
-    logger.info({ chainSlug, txHash, tokenAddr, to: t.to, logIndex: t.logIndex, amountHuman }, "Telegram sent");
+function safeJson<T>(s: string): T {
+  try {
+    return JSON.parse(s) as T;
+  } catch {
+    return {} as T;
   }
 }
 
-export async function handleWebhook(raw: Buffer, headers: Record<string, any>, payload: any) {
-  // Moralis "verify webhook" інколи робить POST без підпису.
-  // Щоб пройти їхню перевірку 200 — відповідаємо OK, але НЕ процесимо нічого.
-  const overrideHeader = process.env.MORALIS_SIGNATURE_HEADER;
-  const sig =
-    (overrideHeader ? headerValue(headers, overrideHeader) : null) ||
-    headerValue(headers, "x-signature") ||
-    headerValue(headers, "x-moralis-signature") ||
-    headerValue(headers, "x-webhook-signature");
-
-  if (!sig) {
-    logger.info({ note: "moralis_verify_no_signature" }, "Webhook verify ping (no signature) -> 200");
-    return { ok: true, verify: true };
-  }
-  verifyMoralisSignature(raw, headers);
-
-  const { chainSlug } = normalizeChainSlug(payload);
-  if (!CHAINS_ALLOWED.has(chainSlug)) {
-    logger.info({ chainSlug }, "Chain not allowed, ignoring");
-    return { ok: true, ignored: true, reason: "chain_not_allowed" };
-  }
-
-  const candidates = findCandidateInteractionTxHashes(payload, INTERACTION_CONTRACT);
-  if (!candidates.length) {
-    return { ok: true, ignored: true, reason: "no_interaction_tx" };
-  }
-
-  let transfers = parseFromMoralisErc20Transfers(payload);
-  if (!transfers.length) transfers = parseFromRawLogs(payload);
-
-  if (!transfers.length) {
-    return { ok: true, ignored: true, reason: "no_transfers" };
-  }
-
-  const ts = payload?.block?.timestamp ?? payload?.block_timestamp ?? payload?.confirmedAt ?? payload?.confirmed_at;
-  const timestampSeconds = typeof ts === "number" ? ts : undefined;
-
-  for (const txHash of candidates) {
-    await processTransfers({
-      chainSlug,
-      interactionContract: INTERACTION_CONTRACT,
-      txHash,
-      transfers,
-      timestampSeconds
-    });
-  }
-
-  return { ok: true };
-}
-
-// ---------- Signature verification ----------
-
-function headerValue(headers: Record<string, any>, name: string): string | null {
-  const v = headers[name] ?? headers[name.toLowerCase()] ?? headers[name.toUpperCase()];
-  if (typeof v === "string") return v;
-  if (Array.isArray(v) && typeof v[0] === "string") return v[0];
-  return null;
-}
-
-function verifyMoralisSignature(raw: Buffer, headers: Record<string, any>) {
-  const overrideHeader = process.env.MORALIS_SIGNATURE_HEADER;
-  const sig =
-    (overrideHeader ? headerValue(headers, overrideHeader) : null) ||
-    headerValue(headers, "x-signature") ||
-    headerValue(headers, "x-moralis-signature") ||
-    headerValue(headers, "x-webhook-signature");
-
-  if (!sig) {
-    const err = new Error("Missing webhook signature header");
-    (err as any).statusCode = 401;
-    throw err;
-  }
-
-  const digest = createHmac("sha256", MORALIS_WEBHOOK_SECRET).update(raw).digest("hex");
-  const normalizedSig = sig.startsWith("sha256=") ? sig.slice("sha256=".length) : sig;
-
-  const a = Buffer.from(digest, "utf8");
-  const b = Buffer.from(normalizedSig, "utf8");
-
-  if (a.length !== b.length || !timingSafeEqual(a, b)) {
-    const err = new Error("Invalid webhook signature");
-    (err as any).statusCode = 401;
-    throw err;
-  }
-}
-
-// ---------- Raw body reader (no plugins) ----------
-
-async function readRawBody(req: any): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req.raw) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  }
-  return Buffer.concat(chunks);
-}
-
-// ---------- Server ----------
-
-export function buildServer() {
-  const app = Fastify({
-    logger: logger as any
-  });
-
-  app.get("/health", async () => ({ ok: true }));
-  app.get("/webhooks/moralis", async () => ({ ok: true, method: "GET", hint: "Use POST for webhooks" }));
-
-  app.post(
-  "/webhooks/moralis",
-  {
-    config: { rawBody: true }
-  },
-  async (req, reply) => {
-    try {
-      const raw = (req as any).rawBody as string | Buffer | undefined;
-      const rawBuf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw || "", "utf8");
-
-      // 1) Якщо немає підпису — це Moralis verify ping -> 200 OK
-      const overrideHeader = process.env.MORALIS_SIGNATURE_HEADER;
-      const sig =
-        (overrideHeader ? headerValue(req.headers as any, overrideHeader) : null) ||
-        headerValue(req.headers as any, "x-signature") ||
-        headerValue(req.headers as any, "x-moralis-signature") ||
-        headerValue(req.headers as any, "x-webhook-signature");
-
-      if (!sig) {
-        logger.info({ note: "moralis_verify_no_signature" }, "Moralis verify ping -> 200");
-        return reply.code(200).send({ ok: true, verify: true });
-      }
-      const bypass = (process.env.MORALIS_VERIFY_BYPASS || "").toLowerCase() === "true";
-      if (bypass) {
-        logger.warn({ note: "moralis_verify_bypass_enabled" }, "Bypass signature check -> 200 (NO processing)");
-        return reply.code(200).send({ ok: true, verify: true });
-      }
-
-      // 2) Підпис є -> валідуємо
-      verifyMoralisSignature(rawBuf, req.headers as any);
-
-      // 3) Payload: намагаємось парсити JSON, але не падаємо якщо body пустий/не JSON
-      let payload: any = (req as any).body;
-      if (!payload || typeof payload === "string") {
-        try {
-          payload = rawBuf.length ? JSON.parse(rawBuf.toString("utf8")) : {};
-        } catch {
-          payload = {};
-        }
-      }
-
-      const result = await handleWebhook(rawBuf, req.headers as any, payload);
-      return reply.code(200).send(result);
-    } catch (err: any) {
-      const status = err?.statusCode || 500;
-      logger.error({ err }, "Webhook error");
-      return reply.code(status).send({ ok: false, error: err?.message || "error" });
-    }
-  }
-);
-
-
-  return app;
-}
-
-async function main() {
-  const port = Number(process.env.PORT || "3000");
-  const host = "0.0.0.0";
-  const app = buildServer();
-  await app.listen({ port, host });
-  logger.info({ port }, "Server started");
-}
-
-if (require.main === module) {
-  main().catch((err) => {
-    logger.error({ err }, "Fatal");
-    process.exit(1);
-  });
+// просте порівняння, ок для невеликих/середніх чисел
+function compareHuman(amount: string, threshold: string): boolean {
+  const a = Number(amount);
+  const b = Number(threshold);
+  if (Number.isNaN(a) || Number.isNaN(b)) return false;
+  return a >= b;
 }

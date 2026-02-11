@@ -1,24 +1,16 @@
-# -------- build stage --------
-FROM node:20-alpine AS build
+FROM node:20-alpine
+
+# Create app directory
 WORKDIR /app
 
-COPY package.json package-lock.json ./
-RUN npm ci
+# Install app dependencies
+COPY package.json package-lock.json* yarn.lock* ./
+RUN npm install --omit=dev
 
-COPY tsconfig.json ./
+COPY tsconfig.json .
 COPY src ./src
 
 RUN npm run build
 
-# -------- runtime stage --------
-FROM node:20-alpine AS runtime
-WORKDIR /app
-ENV NODE_ENV=production
-
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
-
-COPY --from=build /app/dist ./dist
-
 EXPOSE 8080
-CMD ["node", "dist/src/server.js"]
+CMD ["npm", "start"]
