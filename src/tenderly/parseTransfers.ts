@@ -14,11 +14,12 @@ export type ParsedTransfer = {
   logIndex: number;
 };
 
+type ReceiptLike = Pick<TransactionReceipt, 'logs'>;
 function isHex(x: unknown): x is Hex {
   return typeof x === 'string' && x.startsWith('0x');
 }
 
-export function extractTransfersFromReceipt(receipt: TransactionReceipt): ParsedTransfer[] {
+export function extractTransfersFromReceipt(receipt: ReceiptLike): ParsedTransfer[] {
   const out: ParsedTransfer[] = [];
   const logs = receipt?.logs ?? [];
 
