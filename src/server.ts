@@ -13,6 +13,8 @@ import { isDuplicate, markDuplicate } from './dedupe.js';
 import { sendTelegram } from './telegram.js';
 
 const app = express();
+console.log('[boot] server.ts version = 2026-02-11T22:XXZ chainId97=ON');
+
 const pinoHttp = (pinoHttpNS as any).default ?? (pinoHttpNS as any);
 app.use(pinoHttp());
 app.get('/webhooks/tenderly', (_req, res) => res.status(200).send('ok - use POST here'));
@@ -55,6 +57,7 @@ app.post('/webhooks/tenderly', express.raw({ type: 'application/json' }), async 
       req.log.warn({ network }, 'Unsupported network');
       return res.status(200).send('ok');
     }
+    req.log.info({ network, chainKey }, 'network mapped');
 
     // allowlist chains (optional)
     const allow = new Set((process.env.CHAINS || '').split(',').map(s => s.trim()).filter(Boolean));
