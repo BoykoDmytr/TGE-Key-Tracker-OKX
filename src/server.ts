@@ -1,18 +1,19 @@
 // src/server.ts
 import 'dotenv/config';
 import express, { Request, Response } from 'express';
-import pinoHttp from 'pino-http';
+import * as pinoHttpNS from 'pino-http';
 
-import { verifyTenderlySignature } from './tenderly/verify';
-import { extractTransfersFromReceipt } from './tenderly/parseTransfers';
+import { verifyTenderlySignature } from './tenderly/verify.js';
+import { extractTransfersFromReceipt } from './tenderly/parseTransfers.js';
 
-import { getPublicClient, type ChainKey, getExplorerTxUrl } from './evm/provider';
-import { getErc20MetaCached, formatUnitsSafe } from './evm/erc20MetaCache';
+import { getPublicClient, type ChainKey, getExplorerTxUrl } from './evm/provider.js';
+import { getErc20MetaCached, formatUnitsSafe } from './evm/erc20MetaCache.js';
 
-import { isDuplicate, markDuplicate } from './dedupe';
-import { sendTelegram } from './telegram';
+import { isDuplicate, markDuplicate } from './dedupe.js';
+import { sendTelegram } from './telegram.js';
 
 const app = express();
+const pinoHttp = (pinoHttpNS as any).default ?? (pinoHttpNS as any);
 app.use(pinoHttp());
 
 // Tenderly вимагає raw body для signature verification

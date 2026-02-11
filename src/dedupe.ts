@@ -1,7 +1,8 @@
-import Redis from 'ioredis';
+import * as RedisNS from 'ioredis';
 
 const redisUrl = process.env.REDIS_URL || '';
-const redis = redisUrl ? new Redis(redisUrl) : null;
+const Redis = (RedisNS as any).default ?? (RedisNS as any);
+const redis = process.env.REDIS_URL ? new Redis(process.env.REDIS_URL) : null;
 
 /**
  * Check if a key has already been processed. Uses Redis if available, otherwise always false.
