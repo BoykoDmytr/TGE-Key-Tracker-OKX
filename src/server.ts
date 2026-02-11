@@ -136,13 +136,23 @@ const port = Number(process.env.PORT || 8080);
 app.listen(port, () => console.log(`Listening on :${port}`));
 
 function normalizeTenderlyNetwork(net: string): ChainKey | null {
-  const n = net.toLowerCase();
+  const n = String(net).toLowerCase().trim();
+
+  // ✅ chainId формат
+  if (n === '56') return 'bsc';
+  if (n === '97') return 'bsc_testnet';
+  if (n === '8453') return 'base';
+  if (n === '42161') return 'arbitrum';
+
+  // ✅ текстовий формат (інколи Tenderly так шле)
   if (n.includes('bsc') && n.includes('test')) return 'bsc_testnet';
   if (n.includes('bsc') || n.includes('bnb')) return 'bsc';
   if (n.includes('base')) return 'base';
   if (n.includes('arbitrum')) return 'arbitrum';
+
   return null;
 }
+
 
 function safeJson<T>(s: string): T {
   try {
