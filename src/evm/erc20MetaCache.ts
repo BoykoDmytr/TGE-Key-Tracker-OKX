@@ -1,6 +1,6 @@
 // src/evm/erc20MetaCache.ts
 import type { Address } from 'viem';
-import type { EvmClient } from './provider';
+import type { EvmClient } from './provider.js';
 
 // Мінімальний інтерфейс клієнта, який нам потрібен
 export type EvmReader = Pick<EvmClient, 'readContract'>;
