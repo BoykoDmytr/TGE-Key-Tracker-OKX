@@ -538,10 +538,41 @@ export function buildServer() {
 
   app.get("/health", async () => ({ ok: true }));
 
-  app.post("/webhooks/moralis", async (req, reply) => {
+  app.post(
+  "/webhooks/moralis",
+  {
+    config: { rawBody: true }
+  },
+  async (req, reply) => {
     try {
-      const rawBuf = await readRawBody(req);
-      const payload = JSON.parse(rawBuf.toString("utf8"));
+      const raw = (req as any).rawBody as string | Buffer | undefined;
+      const rawBuf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw || "", "utf8");
+
+      // 1) Якщо немає підпису — це Moralis verify ping -> 200 OK
+      const overrideHeader = process.env.MORALIS_SIGNATURE_HEADER;
+      const sig =
+        (overrideHeader ? headerValue(req.headers as any, overrideHeader) : null) ||
+        headerValue(req.headers as any, "x-signature") ||
+        headerValue(req.headers as any, "x-moralis-signature") ||
+        headerValue(req.headers as any, "x-webhook-signature");
+
+      if (!sig) {
+        logger.info({ note: "moralis_verify_no_signature" }, "Moralis verify ping -> 200");
+        return reply.code(200).send({ ok: true, verify: true });
+      }
+
+      // 2) Підпис є -> валідуємо
+      verifyMoralisSignature(rawBuf, req.headers as any);
+
+      // 3) Payload: намагаємось парсити JSON, але не падаємо якщо body пустий/не JSON
+      let payload: any = (req as any).body;
+      if (!payload || typeof payload === "string") {
+        try {
+          payload = rawBuf.length ? JSON.parse(rawBuf.toString("utf8")) : {};
+        } catch {
+          payload = {};
+        }
+      }
 
       const result = await handleWebhook(rawBuf, req.headers as any, payload);
       return reply.code(200).send(result);
@@ -550,7 +581,9 @@ export function buildServer() {
       logger.error({ err }, "Webhook error");
       return reply.code(status).send({ ok: false, error: err?.message || "error" });
     }
-  });
+  }
+);
+
 
   return app;
 }
