@@ -561,6 +561,11 @@ export function buildServer() {
         logger.info({ note: "moralis_verify_no_signature" }, "Moralis verify ping -> 200");
         return reply.code(200).send({ ok: true, verify: true });
       }
+      const bypass = (process.env.MORALIS_VERIFY_BYPASS || "").toLowerCase() === "true";
+      if (bypass) {
+        logger.warn({ note: "moralis_verify_bypass_enabled" }, "Bypass signature check -> 200 (NO processing)");
+        return reply.code(200).send({ ok: true, verify: true });
+      }
 
       // 2) Підпис є -> валідуємо
       verifyMoralisSignature(rawBuf, req.headers as any);
