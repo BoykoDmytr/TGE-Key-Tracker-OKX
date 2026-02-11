@@ -15,6 +15,7 @@ import { sendTelegram } from './telegram.js';
 const app = express();
 const pinoHttp = (pinoHttpNS as any).default ?? (pinoHttpNS as any);
 app.use(pinoHttp());
+app.get('/webhooks/tenderly', (_req, res) => res.status(200).send('ok - use POST here'));
 
 // Tenderly вимагає raw body для signature verification
 app.post('/webhooks/tenderly', express.raw({ type: 'application/json' }), async (req: Request, res: Response) => {
