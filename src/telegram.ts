@@ -1,4 +1,18 @@
-export async function sendTelegram({ botToken, chatId, text }) {
+type SendTelegramEnv = {
+  TELEGRAM_BOT_TOKEN?: string;
+  TELEGRAM_CHAT_ID?: string;
+};
+
+function requireEnv(name: keyof SendTelegramEnv): string {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env var: ${name}`);
+  return v;
+}
+
+export async function sendTelegram(text: string): Promise<void> {
+  const botToken = requireEnv("TELEGRAM_BOT_TOKEN");
+  const chatId = requireEnv("TELEGRAM_CHAT_ID");
+
   const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
   const payload = {
     chat_id: chatId,

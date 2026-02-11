@@ -1,8 +1,0 @@
-{
-  "crons": [
-    {
-      "path": "/api/cron/check-key?secret=secretovka",
-      "schedule": "*/1 * * * *"
-    }
-  ]
-}

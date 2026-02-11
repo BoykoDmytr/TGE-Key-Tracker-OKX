@@ -1,0 +1,23 @@
+{
+  "chainId": "0x2105",
+  "block": { "timestamp": 1700000000 },
+  "txs": [
+    {
+      "hash": "0xabc0000000000000000000000000000000000000000000000000000000000000",
+      "from": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "to": "0x000310fa98e36191ec79de241d72c6ca093eafd3"
+    }
+  ],
+  "erc20Transfers": [
+    {
+      "transactionHash": "0xabc0000000000000000000000000000000000000000000000000000000000000",
+      "logIndex": 12,
+      "address": "0x6b175474e89094c44da98b954eedeac495271d0f",
+      "from": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "to": "0xcccccccccccccccccccccccccccccccccccccccc",
+      "value": "1000000000000000000",
+      "tokenSymbol": "DAI",
+      "tokenDecimals": 18
+    }
+  ]
+}

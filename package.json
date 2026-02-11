@@ -2,10 +2,30 @@
   "name": "tge-key-tracker-ws-bot",
   "version": "1.0.0",
   "private": true,
-  "type": "module",
-  "scripts": { "start": "node src/index.js" },
+  "description": "Moralis Streams webhook receiver to detect ERC-20 transfers in txs that interact with a fixed contract and notify via Telegram.",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
+    "start": "node dist/server.js",
+    "test": "jest"
+  },
   "dependencies": {
-    "dotenv": "^16.3.1",
-    "ethers": "^6.10.0"
+    "@keyv/redis": "^3.0.1",
+    "@keyv/sqlite": "^3.6.7",
+    "ethers": "^6.16.0",
+    "fastify": "^4.29.1",
+    "fastify-raw-body": "^5.0.0",
+    "ioredis": "^5.9.2",
+    "keyv": "^4.5.4",
+    "pino": "^9.14.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.14",
+    "@types/node": "^20.19.33",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.4.6",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.9.3"
   }
 }
