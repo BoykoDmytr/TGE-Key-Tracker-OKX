@@ -15,7 +15,7 @@ import { sendTelegram } from './telegram.js';
 const app = express();
 
 // ====== BOOT LOG ======
-console.log('[boot] server.ts version=2026-02-11T22:XXZ chainId97=ON');
+console.log('[boot] server.ts version=2026-02-12TXX:XXZ allTokensMode=ON');
 console.log('[boot] NODE_ENV=%s PORT=%s', process.env.NODE_ENV, process.env.PORT);
 console.log('[boot] CHAINS=%s', process.env.CHAINS || '(not set)');
 console.log('[boot] INTERACTION_CONTRACT=%s', process.env.INTERACTION_CONTRACT || '(not set)');
@@ -53,7 +53,7 @@ app.post('/webhooks/tenderly', express.raw({ type: 'application/json' }), async 
         datePresent: Boolean(date),
         rawLen,
       },
-      'tenderly webhook received'
+      'tenderly webhook received',
     );
 
     // ---- signing key ----
@@ -78,7 +78,7 @@ app.post('/webhooks/tenderly', express.raw({ type: 'application/json' }), async 
           date,
           rawLen,
         },
-        'Invalid Tenderly signature'
+        'Invalid Tenderly signature',
       );
       return res.status(400).send('Invalid signature');
     }
@@ -92,14 +92,13 @@ app.post('/webhooks/tenderly', express.raw({ type: 'application/json' }), async 
       return res.status(400).send('Bad JSON');
     }
 
-    // Basic payload debug (without dumping everything)
     req.log.info(
       {
         event_type: body?.event_type,
         hasAlert: Boolean(body?.alert),
         topKeys: body ? Object.keys(body).slice(0, 20) : [],
       },
-      'payload parsed'
+      'payload parsed',
     );
 
     // Tenderly event types
@@ -159,19 +158,19 @@ app.post('/webhooks/tenderly', express.raw({ type: 'application/json' }), async 
     // Fetch tx
     req.log.info({ txHash }, 'fetching transaction');
     const tx = await client.getTransaction({ hash: txHash as `0x${string}` });
-    
+
     req.log.info(
       {
         txTo: tx?.to || null,
         txFrom: (tx as any)?.from || null,
       },
-      'transaction fetched'
+      'transaction fetched',
     );
 
     if (!tx.to || tx.to.toLowerCase() !== interactionAddr) {
       req.log.info(
         { txTo: tx?.to || null, interactionAddr },
-        'tx.to != INTERACTION_CONTRACT (not our interaction) - ignored'
+        'tx.to != INTERACTION_CONTRACT (not our interaction) - ignored',
       );
       return res.status(200).send('ok');
     }
@@ -186,7 +185,7 @@ app.post('/webhooks/tenderly', express.raw({ type: 'application/json' }), async 
         status: (receipt as any)?.status,
         blockNumber: (receipt as any)?.blockNumber?.toString?.() ?? (receipt as any)?.blockNumber,
       },
-      'receipt fetched'
+      'receipt fetched',
     );
 
     const transfers = extractTransfersFromReceipt(receipt);
@@ -197,25 +196,29 @@ app.post('/webhooks/tenderly', express.raw({ type: 'application/json' }), async 
     // Thresholds / labels
     const thresholds: Record<string, string> = safeJson(process.env.THRESHOLDS_JSON || '{}');
     const thresholdsLower: Record<string, string> = {};
-    for (const [addr, human] of Object.entries(thresholds)) thresholdsLower[addr.toLowerCase()] = String(human);
+    for (const [addr, human] of Object.entries(thresholds || {})) thresholdsLower[addr.toLowerCase()] = String(human);
+
+    const strictMode = Object.keys(thresholdsLower).length > 0;
 
     const tokenLabels: Record<string, string> = safeJson(process.env.TOKEN_LABELS_JSON || '{}');
     const tokenLabelsLower: Record<string, string> = {};
-    for (const [addr, label] of Object.entries(tokenLabels)) tokenLabelsLower[addr.toLowerCase()] = String(label);
+    for (const [addr, label] of Object.entries(tokenLabels || {})) tokenLabelsLower[addr.toLowerCase()] = String(label);
 
     req.log.info(
       {
+        strictMode,
         thresholdsKeys: Object.keys(thresholdsLower).slice(0, 20),
         labelsKeys: Object.keys(tokenLabelsLower).slice(0, 20),
       },
-      'loaded thresholds/labels'
+      'loaded thresholds/labels',
     );
 
     // Process transfers
     let sentCount = 0;
+
     for (const t of transfers) {
       const tokenAddrLower = t.token.toLowerCase();
-      const threshHuman = thresholdsLower[tokenAddrLower];
+      const threshHuman = thresholdsLower[tokenAddrLower] ?? null;
 
       req.log.info(
         {
@@ -225,13 +228,16 @@ app.post('/webhooks/tenderly', express.raw({ type: 'application/json' }), async 
           logIndex: t.logIndex,
           value: t.value.toString(),
           hasThreshold: Boolean(threshHuman),
-          threshold: threshHuman || null,
+          threshold: threshHuman,
         },
-        'transfer candidate'
+        'transfer candidate',
       );
 
       // strict mode: only tokens in thresholds
-      if (!threshHuman) continue;
+      if (strictMode && !threshHuman) {
+        req.log.info({ token: t.token }, 'skip: token not in thresholds (strictMode)');
+        continue;
+      }
 
       const dedupeKey = `${chainKey}:${txHash}:${t.logIndex}:${tokenAddrLower}:${t.to.toLowerCase()}`;
       const dup = await isDuplicate(dedupeKey);
@@ -242,6 +248,14 @@ app.post('/webhooks/tenderly', express.raw({ type: 'application/json' }), async 
       req.log.info({ token: t.token }, 'fetching token meta');
       const meta = await getErc20MetaCached(client as any, t.token);
       const amountHuman = formatUnitsSafe(t.value, meta.decimals);
+      function compareHuman(amount: string, threshold: string): boolean {
+        const a = Number(amount);
+        const b = Number(threshold);
+        if (Number.isNaN(a) || Number.isNaN(b)) return false;
+        return a >= b;
+      }
+      // threshold compare: if there is a per-token threshold -> enforce it, else allow (non-strict)
+      const pass = threshHuman ? compareHuman(amountHuman, String(threshHuman)) : true;
 
       req.log.info(
         {
@@ -250,13 +264,11 @@ app.post('/webhooks/tenderly', express.raw({ type: 'application/json' }), async 
           decimals: meta.decimals,
           amountHuman,
           threshold: threshHuman,
+          pass,
         },
-        'meta + amount'
+        'meta + amount',
       );
 
-      // threshold compare
-      const pass = compareHuman(amountHuman, threshHuman);
-      req.log.info({ pass }, 'threshold compare');
       if (!pass) continue;
 
       const explorer = getExplorerTxUrl(chainKey, txHash);
@@ -289,7 +301,7 @@ app.post('/webhooks/tenderly', express.raw({ type: 'application/json' }), async 
         stack: err?.stack,
         ms: Date.now() - startedAt,
       },
-      'Error handling webhook'
+      'Error handling webhook',
     );
     return res.status(500).send('error');
   }
@@ -322,12 +334,6 @@ function safeJson<T>(s: string): T {
     return JSON.parse(s) as T;
   } catch {
     return {} as T;
-  }
 }
 
-function compareHuman(amount: string, threshold: string): boolean {
-  const a = Number(amount);
-  const b = Number(threshold);
-  if (Number.isNaN(a) || Number.isNaN(b)) return false;
-  return a >= b;
 }
