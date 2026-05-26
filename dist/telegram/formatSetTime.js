@@ -65,9 +65,7 @@ export function formatSetTimeMessage(args) {
     return (`⏰ <b>${escHtml('NEW SET TIME')}</b>\n\n` +
         `Token: ${escHtml(tokenLine)}\n` +
         `Network: ${escHtml(prettyNetwork(chainKey))}\n` +
-        `Start: ${escHtml(fmtUtc(startTime))} (${escHtml(relFromNow(startTime))})\n` +
-        `End: ${escHtml(fmtUtc(endTime))} (${escHtml(relFromNow(endTime))})\n` +
-        `Duration: ${escHtml(humanizeDuration(duration))}\n\n` +
+        `Claim Time: ${escHtml(fmtUtc(startTime))} (${escHtml(relFromNow(startTime))})\n` +
         `<a href="${escHtml(explorer)}">${escHtml('View on Scan')}</a>\n\n` +
         `<a href="https://t.me/cryptohornettg/1354">Refback 45%</a>`);
 }
