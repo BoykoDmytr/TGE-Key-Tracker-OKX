@@ -17,6 +17,10 @@ import { addTracked, getTracked } from './store/trackedDistributors.js';
 import { decodeSetTime } from './evm/decodeSetTime.js';
 import { formatSetTimeMessage } from './telegram/formatSetTime.js';
 
+import { processSetTimeTx, processDepositTx } from './handlers.js';
+import { addFactory, listFactories } from './store/factories.js';
+import { startPoller } from './poller/index.js';
+
 const app = express();
 
 // ✅ GLOBAL MIN AMOUNT FILTER (tokens)
@@ -195,167 +199,15 @@ app.post('/webhooks/tenderly', express.raw({ type: 'application/json' }), async 
       return res.status(200).send('ok');
     }
 
-    // Receipt + transfers
-    req.log.info({ txHash }, 'fetching receipt');
-    const receipt = await client.getTransactionReceipt({ hash: txHash as `0x${string}` });
+    // Process deposit (transfers -> threshold -> notify -> addTracked) via shared handler.
+    const { sent, tracked } = await processDepositTx(chainKey, txHash, client, {
+      notify: true,
+      persist: true,
+      source: 'webhook',
+      log: req.log as any,
+    });
 
-    req.log.info(
-      {
-        logsCount: receipt?.logs?.length ?? 0,
-        status: (receipt as any)?.status,
-        blockNumber: (receipt as any)?.blockNumber?.toString?.() ?? (receipt as any)?.blockNumber,
-      },
-      'receipt fetched',
-    );
-
-    const transfers = extractTransfersFromReceipt(receipt);
-    req.log.info({ transfersCount: transfers.length }, 'parsed transfers');
-
-    if (!transfers.length) return res.status(200).send('ok');
-
-    // Thresholds / labels
-    const thresholds: Record<string, string> = safeJson(process.env.THRESHOLDS_JSON || '{}');
-    const thresholdsLower: Record<string, string> = {};
-    for (const [addr, human] of Object.entries(thresholds || {}))
-      thresholdsLower[addr.toLowerCase()] = String(human);
-
-    const strictMode = Object.keys(thresholdsLower).length > 0;
-
-    const tokenLabels: Record<string, string> = safeJson(process.env.TOKEN_LABELS_JSON || '{}');
-    const tokenLabelsLower: Record<string, string> = {};
-    for (const [addr, label] of Object.entries(tokenLabels || {}))
-      tokenLabelsLower[addr.toLowerCase()] = String(label);
-
-    req.log.info(
-      {
-        strictMode,
-        thresholdsKeys: Object.keys(thresholdsLower).slice(0, 20),
-        labelsKeys: Object.keys(tokenLabelsLower).slice(0, 20),
-      },
-      'loaded thresholds/labels',
-    );
-
-    // Process transfers
-    let sentCount = 0;
-
-    for (const t of transfers) {
-      const tokenAddrLower = t.token.toLowerCase();
-      const threshHuman = thresholdsLower[tokenAddrLower] ?? null;
-
-      req.log.info(
-        {
-          token: t.token,
-          from: t.from,
-          to: t.to,
-          logIndex: t.logIndex,
-          value: t.value.toString(),
-          hasThreshold: Boolean(threshHuman),
-          threshold: threshHuman,
-        },
-        'transfer candidate',
-      );
-
-      // strict mode: only tokens in thresholds
-      if (strictMode && !threshHuman) {
-        req.log.info({ token: t.token }, 'skip: token not in thresholds (strictMode)');
-        continue;
-      }
-
-      const dedupeKey = `${chainKey}:${txHash}:${t.logIndex}:${tokenAddrLower}:${t.to.toLowerCase()}`;
-      const dup = await isDuplicate(dedupeKey);
-      req.log.info({ dedupeKey, dup }, 'dedupe check');
-      if (dup) continue;
-
-      // meta
-      req.log.info({ token: t.token }, 'fetching token meta');
-      const meta = await getErc20MetaCached(client as any, t.token);
-      const amountHuman = formatUnitsSafe(t.value, meta.decimals);
-
-      // ✅ GLOBAL FILTER: skip if amount < 5000 tokens
-      const amountNum = Number(amountHuman);
-      if (!Number.isNaN(amountNum) && amountNum < MIN_TOKEN_AMOUNT) {
-        req.log.info({ amountHuman, MIN_TOKEN_AMOUNT }, 'skip: amount below global minimum');
-        continue;
-      }
-
-      function compareHuman(amount: string, threshold: string): boolean {
-        const a = Number(amount);
-        const b = Number(threshold);
-        if (Number.isNaN(a) || Number.isNaN(b)) return false;
-        return a >= b;
-      }
-
-      // threshold compare: if there is a per-token threshold -> enforce it, else allow (non-strict)
-      const pass = threshHuman ? compareHuman(amountHuman, String(threshHuman)) : true;
-
-      req.log.info(
-        {
-          token: t.token,
-          symbol: meta.symbol,
-          decimals: meta.decimals,
-          amountHuman,
-          threshold: threshHuman,
-          pass,
-        },
-        'meta + amount',
-      );
-
-      if (!pass) continue;
-
-      const explorer = getExplorerTxUrl(chainKey, txHash);
-
-      // красиве ім’я мережі без underscore (щоб не ламало Markdown)
-      const networkPretty =
-          chainKey === 'bsc_testnet' ? 'BSC Testnet' :
-          chainKey === 'bsc' ? 'BSC' :
-          chainKey === 'base' ? 'Base' :
-          chainKey === 'arbitrum' ? 'Arbitrum' :
-          chainKey === 'ethereum' ? 'Ethereum' :      // нове
-          chainKey === 'avalanche' ? 'Avalanche' :    // нове
-          chainKey === 'optimism' ? 'Optimism' :      // нове
-          chainKey;
-
-
-      const label = tokenLabelsLower[tokenAddrLower] || meta.symbol;
-      const amountLine = `${formatNumberWithCommas(amountHuman)} $${label}`;
-
-      // ✅ MESSAGE EXACT FORMAT (MarkdownV2 + quote + link)
-      // IMPORTANT: sendTelegram must use parse_mode: 'MarkdownV2'
-      function escHtml(s: string): string {
-      return s
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;');
-      }
-
-      const message =
-        `⚡ <b>${escHtml('NEW OKX DEPOSIT DETECTED')}</b>\n\n` +
-        `Amount: ${escHtml(amountLine)}\n` +
-        `Network: ${escHtml(networkPretty)}\n` +
-        `<a href="${escHtml(explorer)}">${escHtml('View on Scan')}</a>\n\n` +
-        `<a href="https://t.me/cryptohornettg/1354">Refback 45%</a>`;
-
-      req.log.info({ messagePreview: message.slice(0, 200) }, 'sending telegram');
-      await sendTelegram(message);
-      sentCount++;
-
-      // Remember the new Distributor address in the allowlist for setTime
-      await addTracked(chainKey, t.to, {
-        depositTxHash: txHash,
-        addedAt: Math.floor(Date.now() / 1000),
-        tokenAddress: t.token,
-        tokenSymbol: meta.symbol,
-        amountHuman,
-      });
-      req.log.info({ chainKey, distributor: t.to }, 'added to setTime allowlist');
-
-      await markDuplicate(dedupeKey);
-      req.log.info({ dedupeKey }, 'marked duplicate');
-    }
-
-    req.log.info({ sentCount, ms: Date.now() - startedAt }, 'webhook processed');
+    req.log.info({ sent, tracked, ms: Date.now() - startedAt }, 'webhook processed');
     return res.status(200).send('ok');
   } catch (err: any) {
     (req as any).log?.error?.(
@@ -387,36 +239,13 @@ app.post('/webhooks/settime', express.json(), async (req: Request, res: Response
     const chainKey = normalizeTenderlyNetwork(String(network));
     if (!chainKey) return res.status(200).send('unsupported network');
 
-    // 2. Decode selector + 2×uint256
-    const decoded = decodeSetTime(String(input));
-    if (!decoded) {
-      req.log.info({ tx_hash }, 'not a setTime call');
-      return res.status(200).send('ok');
-    }
+    // Decode + allowlist + dedup + send via shared handler (same path the poller uses).
+    const r = await processSetTimeTx(
+      { chainKey, txHash: String(tx_hash), to: String(to), input: String(input) },
+      { notify: true, source: 'webhook', log: req.log as any },
+    );
 
-    // 3. Allowlist filter — only Distributors that already passed a deposit alert
-    const tracked = await getTracked(chainKey, String(to));
-    if (!tracked) {
-      req.log.info({ chainKey, to, tx_hash }, 'setTime for non-tracked distributor, skipping');
-      return res.status(200).send('ok');
-    }
-
-    // 4. Dedupe
-    const dedupeKey = `settime:${chainKey}:${tx_hash}`;
-    if (await isDuplicate(dedupeKey)) return res.status(200).send('ok');
-
-    // 5. Format + send
-    const message = formatSetTimeMessage({
-      chainKey,
-      tracked,
-      startTime: decoded.startTime,
-      duration: decoded.duration,
-      txHash: String(tx_hash),
-    });
-    await sendTelegram(message);
-    await markDuplicate(dedupeKey);
-
-    req.log.info({ chainKey, to, tx_hash }, 'setTime notification sent');
+    req.log.info({ chainKey, to, tx_hash, result: r }, 'settime processed');
     return res.status(200).send('ok');
   } catch (err: any) {
     (req as any).log?.error?.({ err: err?.message || err }, 'settime webhook error');
@@ -472,9 +301,65 @@ app.post('/admin/tracked', express.json(), async (req: Request, res: Response) =
   }
 });
 
+// ====== ADMIN: manage watched factory addresses (for the block poller) ======
+app.post('/admin/factory', express.json(), async (req: Request, res: Response) => {
+  try {
+    const secret = req.header('x-admin-secret') || '';
+    if (!process.env.ADMIN_SECRET || secret !== process.env.ADMIN_SECRET) {
+      return res.status(401).send('unauthorized');
+    }
+
+    const items = Array.isArray(req.body) ? req.body : [req.body];
+    if (!items.length) return res.status(400).send('empty body');
+
+    const results: Array<{ chain: string; address: string; ok: boolean; err?: string }> = [];
+    for (const it of items) {
+      try {
+        if (!it || !it.chain || !it.address) {
+          results.push({ chain: it?.chain || '', address: it?.address || '', ok: false, err: 'missing chain/address' });
+          continue;
+        }
+        const chainKey = normalizeTenderlyNetwork(String(it.chain));
+        if (!chainKey) {
+          results.push({ chain: it.chain, address: it.address, ok: false, err: 'unsupported chain' });
+          continue;
+        }
+        await addFactory(chainKey, String(it.address));
+        results.push({ chain: chainKey, address: String(it.address).toLowerCase(), ok: true });
+      } catch (e: any) {
+        results.push({ chain: it?.chain || '', address: it?.address || '', ok: false, err: e?.message || String(e) });
+      }
+    }
+    const added = results.filter((r) => r.ok).length;
+    req.log.info({ added, total: items.length }, 'admin factory updated');
+    return res.json({ added, total: items.length, results });
+  } catch (err: any) {
+    (req as any).log?.error?.({ err: err?.message || err }, 'admin factory error');
+    return res.status(500).send('error');
+  }
+});
+
+app.get('/admin/factory', async (req: Request, res: Response) => {
+  const secret = req.header('x-admin-secret') || '';
+  if (!process.env.ADMIN_SECRET || secret !== process.env.ADMIN_SECRET) {
+    return res.status(401).send('unauthorized');
+  }
+  const chain = normalizeTenderlyNetwork(String(req.query.chain || ''));
+  if (!chain) return res.status(400).send('bad/missing chain');
+  return res.json({ chain, factories: await listFactories(chain) });
+});
+
 // ====== START ======
+console.log('[boot] POLLER_ENABLED=%s POLLER_SHADOW=%s POLLER_CHAINS=%s FACTORIES_DEFAULT=%s',
+  process.env.POLLER_ENABLED || '0', process.env.POLLER_SHADOW || '0',
+  process.env.POLLER_CHAINS || process.env.CHAINS || '(none)',
+  process.env.FACTORIES_DEFAULT ? '(set)' : '(not set)');
+
 const port = Number(process.env.PORT || 8080);
-app.listen(port, () => console.log(`Listening on :${port}`));
+app.listen(port, () => {
+  console.log(`Listening on :${port}`);
+  startPoller();
+});
 
 function normalizeTenderlyNetwork(net: string): ChainKey | null {
   const n = String(net).toLowerCase().trim();
