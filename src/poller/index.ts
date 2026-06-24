@@ -32,6 +32,10 @@ const MAX_BATCH = Number(process.env.POLLER_MAX_BATCH || 300);
 const CONCURRENCY = Number(process.env.POLLER_BLOCK_CONCURRENCY || 6);
 const SHADOW = process.env.POLLER_SHADOW === '1';
 const DEPOSITS_ENABLED = process.env.POLLER_DEPOSITS !== '0'; // default on
+// Persist the cursor to Redis at most this often (keeps Upstash command count low).
+// In-memory cursor still advances every block; we also force-persist right after any
+// match so a restart never re-posts an already-handled event.
+const CURSOR_PERSIST_MS = Number(process.env.POLLER_CURSOR_PERSIST_MS || 60_000);
 
 function confFor(chain: ChainKey): number {
   const v = Number(process.env[`POLLER_CONF_${chain.toUpperCase()}`]);
@@ -92,10 +96,11 @@ async function runChainLoop(chain: ChainKey): Promise<void> {
 
   let lastFactoryRefresh = Date.now();
   let lastProgress = Date.now();
+  let lastPersist = Date.now();
 
   for (;;) {
     try {
-      if (Date.now() - lastFactoryRefresh > 60_000) {
+      if (Date.now() - lastFactoryRefresh > 300_000) {
         await loadFactories(chain);
         lastFactoryRefresh = Date.now();
       }
@@ -114,15 +119,21 @@ async function runChainLoop(chain: ChainKey): Promise<void> {
 
           // If any block failed (null), stop this batch BEFORE advancing past the gap.
           let advanceTo: number = cursor;
+          let matched = false;
           for (let i = 0; i < blocks.length; i++) {
             if (!blocks[i]) break; // leave cursor before the missing block; retry next tick
-            await scanBlock(chain, blocks[i]);
+            if (await scanBlock(chain, blocks[i])) matched = true;
             advanceTo = batch[i];
           }
           if (advanceTo > cursor) {
             cursor = advanceTo;
-            await setCursor(chain, cursor);
             lastProgress = Date.now();
+            // Persist sparingly to keep Upstash command count low: time-based, OR
+            // immediately after a match so a restart never re-posts a handled event.
+            if (matched || Date.now() - lastPersist >= CURSOR_PERSIST_MS) {
+              await setCursor(chain, cursor);
+              lastPersist = Date.now();
+            }
           }
           if (advanceTo !== batch[batch.length - 1]) break; // had a gap; retry next tick
         }
@@ -148,9 +159,12 @@ async function fetchBlock(client: any, chain: ChainKey, n: number): Promise<any 
   }
 }
 
-async function scanBlock(chain: ChainKey, block: any): Promise<void> {
+// Returns true if the block contained a setTime or tracked-factory deposit we handled
+// (used to force a cursor checkpoint so a restart never re-posts it).
+async function scanBlock(chain: ChainKey, block: any): Promise<boolean> {
   const facs = factoriesFor(chain);
   const blockTs = Number(block.timestamp);
+  let matched = false;
 
   for (const tx of block.transactions || []) {
     const input: string = (tx.input || '0x') as string;
@@ -160,24 +174,27 @@ async function scanBlock(chain: ChainKey, block: any): Promise<void> {
 
     if (sel === SETTIME_SELECTOR) {
       try {
-        await processSetTimeTx(
+        const r = await processSetTimeTx(
           { chainKey: chain, txHash: tx.hash, to, input },
           { notify: !SHADOW, source: 'poller' },
         );
+        if (r?.sent) matched = true; // we actually posted -> force a checkpoint
       } catch (e: any) {
         console.error('[poller:%s] setTime handler error %s: %s', chain, tx.hash, e?.message || e);
       }
     } else if (DEPOSITS_ENABLED && sel === CREATE_DISTRIBUTOR_SELECTOR && to && facs.has(to)) {
       try {
-        await processDepositTx(chain, tx.hash, getPollerClient(chain), {
+        const r = await processDepositTx(chain, tx.hash, getPollerClient(chain), {
           notify: !SHADOW,
           persist: !SHADOW,
           source: 'poller',
           blockTimestamp: blockTs,
         });
+        if (r && r.sent > 0) matched = true; // we actually posted -> force a checkpoint
       } catch (e: any) {
         console.error('[poller:%s] deposit handler error %s: %s', chain, tx.hash, e?.message || e);
       }
     }
   }
+  return matched;
 }
