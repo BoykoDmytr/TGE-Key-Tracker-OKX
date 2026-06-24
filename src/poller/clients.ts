@@ -29,10 +29,13 @@ const DEFAULT_RPCS: Record<string, string[]> = {
 
 function rpcsFor(chain: ChainKey): string[] {
   const upper = chain.toUpperCase();
+  // Poller-specific endpoints (optional) first, then the reliable public pool.
+  // We intentionally do NOT auto-include the bot's RPC_<CHAIN> (e.g. a metered
+  // nodereal key shared with the webhook path) — the poller's continuous block
+  // fetching would burn that quota. Add it via POLLER_RPCS_<CHAIN> if you want it.
   const fromEnv = (process.env[`POLLER_RPCS_${upper}`] || '')
     .split(',').map((s) => s.trim()).filter(Boolean);
-  const single = (process.env[`RPC_${upper}`] || '').trim();
-  const list = [...(single ? [single] : []), ...fromEnv, ...(DEFAULT_RPCS[chain] || [])];
+  const list = [...fromEnv, ...(DEFAULT_RPCS[chain] || [])];
   return [...new Set(list)];
 }
 
