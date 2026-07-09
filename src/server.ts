@@ -20,6 +20,14 @@ import { formatSetTimeMessage } from './telegram/formatSetTime.js';
 import { processSetTimeTx, processDepositTx } from './handlers.js';
 import { addFactory, listFactories } from './store/factories.js';
 import { startPoller } from './poller/index.js';
+import { startSolanaPoller } from './poller-solana/index.js';
+
+// Admin endpoints accept EVM chain keys plus 'solana' (Solana allowlist / program list).
+function normalizeAdminChain(net: string): string | null {
+  const n = String(net).toLowerCase().trim();
+  if (n === 'solana' || n === 'sol') return 'solana';
+  return normalizeTenderlyNetwork(n);
+}
 
 const app = express();
 
@@ -273,7 +281,7 @@ app.post('/admin/tracked', express.json(), async (req: Request, res: Response) =
           results.push({ chain: it?.chain || '', address: it?.address || '', ok: false, err: 'missing chain/address' });
           continue;
         }
-        const chainKey = normalizeTenderlyNetwork(String(it.chain));
+        const chainKey = normalizeAdminChain(String(it.chain));
         if (!chainKey) {
           results.push({ chain: it.chain, address: it.address, ok: false, err: 'unsupported chain' });
           continue;
@@ -319,7 +327,7 @@ app.post('/admin/factory', express.json(), async (req: Request, res: Response) =
           results.push({ chain: it?.chain || '', address: it?.address || '', ok: false, err: 'missing chain/address' });
           continue;
         }
-        const chainKey = normalizeTenderlyNetwork(String(it.chain));
+        const chainKey = normalizeAdminChain(String(it.chain));
         if (!chainKey) {
           results.push({ chain: it.chain, address: it.address, ok: false, err: 'unsupported chain' });
           continue;
@@ -344,21 +352,23 @@ app.get('/admin/factory', async (req: Request, res: Response) => {
   if (!process.env.ADMIN_SECRET || secret !== process.env.ADMIN_SECRET) {
     return res.status(401).send('unauthorized');
   }
-  const chain = normalizeTenderlyNetwork(String(req.query.chain || ''));
+  const chain = normalizeAdminChain(String(req.query.chain || ''));
   if (!chain) return res.status(400).send('bad/missing chain');
   return res.json({ chain, factories: await listFactories(chain) });
 });
 
 // ====== START ======
-console.log('[boot] POLLER_ENABLED=%s POLLER_SHADOW=%s POLLER_CHAINS=%s FACTORIES_DEFAULT=%s',
+console.log('[boot] POLLER_ENABLED=%s POLLER_SHADOW=%s POLLER_CHAINS=%s FACTORIES_DEFAULT=%s POLLER_SOLANA=%s POLLER_SOLANA_SHADOW=%s',
   process.env.POLLER_ENABLED || '0', process.env.POLLER_SHADOW || '0',
   process.env.POLLER_CHAINS || process.env.CHAINS || '(none)',
-  process.env.FACTORIES_DEFAULT ? '(set)' : '(not set)');
+  process.env.FACTORIES_DEFAULT ? '(set)' : '(not set)',
+  process.env.POLLER_SOLANA || '0', process.env.POLLER_SOLANA_SHADOW || '0');
 
 const port = Number(process.env.PORT || 8080);
 app.listen(port, () => {
   console.log(`Listening on :${port}`);
   startPoller();
+  startSolanaPoller();
 });
 
 function normalizeTenderlyNetwork(net: string): ChainKey | null {

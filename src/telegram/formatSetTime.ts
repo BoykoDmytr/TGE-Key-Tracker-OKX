@@ -1,6 +1,7 @@
 // src/telegram/formatSetTime.ts
 import { getExplorerTxUrl, type ChainKey } from '../evm/provider.js';
 import { formatNumberWithCommas } from '../utils/formatNumberWithCommas.js';
+import { kyivTimeShort } from '../utils/kyivTime.js';
 import type { TrackedInfo } from '../store/trackedDistributors.js';
 
 function escHtml(s: string): string {
@@ -33,31 +34,9 @@ function fmtUtc(unix: number): string {
   return `${pad(d.getUTCDate())}.${pad(d.getUTCMonth() + 1)}.${d.getUTCFullYear()} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())} UTC`;
 }
 
-// seconds -> "14d" / "14d 5h" / "5h" / "30m"
-function humanizeDuration(seconds: number): string {
-  const d = Math.floor(seconds / 86400);
-  const h = Math.floor((seconds % 86400) / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const parts: string[] = [];
-  if (d > 0) parts.push(`${d}d`);
-  if (h > 0) parts.push(`${h}h`);
-  if (!parts.length) parts.push(`${m}m`);
-  return parts.join(' ');
-}
-
-// relative to now -> "in 55d 23h" / "12h ago"
-function relFromNow(targetUnix: number): string {
-  const now = Math.floor(Date.now() / 1000);
-  const diff = targetUnix - now;
-  const ahead = diff >= 0;
-  const abs = Math.abs(diff);
-  const d = Math.floor(abs / 86400);
-  const h = Math.floor((abs % 86400) / 3600);
-  const parts: string[] = [];
-  if (d > 0) parts.push(`${d}d`);
-  parts.push(`${h}h`);
-  const body = parts.join(' ');
-  return ahead ? `in ${body}` : `${body} ago`;
+// "03.06.2026 14:00 UTC | 17:00 Kyiv"
+export function fmtUtcKyiv(unix: number): string {
+  return `${fmtUtc(unix)} | ${kyivTimeShort(unix)}`;
 }
 
 export interface FormatSetTimeArgs {
@@ -69,8 +48,7 @@ export interface FormatSetTimeArgs {
 }
 
 export function formatSetTimeMessage(args: FormatSetTimeArgs): string {
-  const { chainKey, tracked, startTime, duration, txHash } = args;
-  const endTime = startTime + duration;
+  const { chainKey, tracked, startTime, txHash } = args;
 
   const amount = tracked.amountHuman ? formatNumberWithCommas(tracked.amountHuman) : '';
   const tokenLine = `${amount}${amount ? ' ' : ''}$${tracked.tokenSymbol}`.trim();
@@ -81,7 +59,7 @@ export function formatSetTimeMessage(args: FormatSetTimeArgs): string {
     `⏰ <b>${escHtml('NEW SET TIME')}</b>\n\n` +
     `Token: ${escHtml(tokenLine)}\n` +
     `Network: ${escHtml(prettyNetwork(chainKey))}\n` +
-    `Claim Time: ${escHtml(fmtUtc(startTime))} (${escHtml(relFromNow(startTime))})\n` +
+    `Claim Time: ${escHtml(fmtUtcKyiv(startTime))}\n` +
     `<a href="${escHtml(explorer)}">${escHtml('View on Scan')}</a>\n\n` +
     `<a href="https://t.me/cryptohornettg/1354">Refback 45%</a>`
   );
