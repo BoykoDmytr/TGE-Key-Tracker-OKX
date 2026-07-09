@@ -46,8 +46,10 @@ function solscanTx(sig: string): string {
 function programs(): string[] {
   const fromEnv = (process.env.SOLANA_PROGRAMS || '')
     .split(',').map((s) => s.trim()).filter(Boolean);
-  // future programs can also be added at runtime via POST /admin/factory {chain:"solana"}
-  const fromStore = [...factoriesFor('solana')];
+  // Future programs can also be added at runtime via POST /admin/factory {chain:"solana"}.
+  // The factories store seeds every chain with FACTORIES_DEFAULT (EVM 0x… addresses) —
+  // filter those out: only base58 Solana program ids belong here.
+  const fromStore = [...factoriesFor('solana')].filter((a) => !a.startsWith('0x'));
   return [...new Set([...(fromEnv.length ? fromEnv : DEFAULT_PROGRAMS), ...fromStore])];
 }
 
