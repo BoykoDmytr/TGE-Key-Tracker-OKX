@@ -88,7 +88,7 @@ async function runLoop(): Promise<void> {
         lastStoreRefresh = Date.now();
       }
       for (const program of programs()) {
-        await pollProgram(program, lastPersist);
+        await pollProgram(program, lastPersist, cursorCache);
       }
     } catch (e: any) {
       console.error('[solana] tick error: %s', e?.message || e);
@@ -97,13 +97,26 @@ async function runLoop(): Promise<void> {
   }
 }
 
-async function pollProgram(program: string, lastPersist: Map<string, number>): Promise<void> {
-  const cursor = await getCursor(program);
+// In-memory cursor cache: Redis is read once per program (boot) and written on
+// checkpoints only — keeps Upstash reads near zero (same pattern as the EVM poller).
+const cursorCache = new Map<string, string>();
+
+async function pollProgram(program: string, lastPersist: Map<string, number>, cache: Map<string, string>): Promise<void> {
+  let cursor = cache.get(program);
+  if (!cursor) {
+    const fromRedis = await getCursor(program);
+    if (fromRedis) {
+      cursor = fromRedis;
+      cache.set(program, fromRedis);
+      console.log('[solana:%s…] resuming from cursor %s…', program.slice(0, 8), fromRedis.slice(0, 16));
+    }
+  }
 
   // First run: seed at the newest signature — future events only, no history spam.
   if (!cursor) {
     const sigs = await solRpc('getSignaturesForAddress', [program, { limit: 1 }]);
     if (sigs?.length) {
+      cache.set(program, sigs[0].signature);
       await setCursor(program, sigs[0].signature);
       console.log('[solana:%s…] seeded cursor at %s…', program.slice(0, 8), sigs[0].signature.slice(0, 16));
     }
@@ -156,6 +169,7 @@ async function pollProgram(program: string, lastPersist: Map<string, number>): P
     }
 
     if (processedUpTo) {
+      cache.set(program, processedUpTo); // in-memory advance: next tick never re-fetches these sigs
       const last = lastPersist.get(program) || 0;
       if (posted || Date.now() - last >= CURSOR_PERSIST_MS) {
         await setCursor(program, processedUpTo);
@@ -168,6 +182,7 @@ async function pollProgram(program: string, lastPersist: Map<string, number>): P
 
   // End-of-window checkpoint so a quiet program still advances durably.
   if (processedUpTo) {
+    cache.set(program, processedUpTo);
     await setCursor(program, processedUpTo);
     lastPersist.set(program, Date.now());
   }
