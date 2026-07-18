@@ -1,7 +1,7 @@
 // src/evm/provider.ts
 import { createPublicClient, http } from 'viem';
 import { bsc, bscTestnet, base, arbitrum,
-         mainnet, avalanche, optimism } from 'viem/chains';
+         mainnet, avalanche, optimism, xLayer } from 'viem/chains';
 
 export type ChainKey =
   | 'bsc'
@@ -10,7 +10,8 @@ export type ChainKey =
   | 'arbitrum'
   | 'ethereum'
   | 'avalanche'
-  | 'optimism';
+  | 'optimism'
+  | 'xlayer';
 
 // Мінімум методів, які нам треба (без "важких" типів viem)
 export type EvmClient = {
@@ -27,6 +28,7 @@ const RPC: Record<ChainKey, string> = {
   ethereum: process.env.RPC_ETHEREUM || '',
   avalanche: process.env.RPC_AVALANCHE || '',
   optimism: process.env.RPC_OPTIMISM || '',
+  xlayer: process.env.RPC_XLAYER || '',
 };
 
 const CHAIN = {
@@ -37,6 +39,7 @@ const CHAIN = {
   ethereum: mainnet,
   avalanche,
   optimism,
+  xlayer: xLayer,
 } as const;
 
 const clients = new Map<ChainKey, EvmClient>();
@@ -66,6 +69,7 @@ const DEFAULT_EXPLORERS: Record<ChainKey, string> = {
   ethereum: 'https://etherscan.io/tx/',
   avalanche: 'https://snowtrace.io/tx/',
   optimism: 'https://optimistic.etherscan.io/tx/',
+  xlayer: 'https://www.oklink.com/xlayer/tx/',
 };
 
 // Env var keys for each chain
@@ -77,6 +81,7 @@ const EXPLORER_ENV_KEYS: Record<ChainKey, string> = {
   ethereum: 'EXPLORER_ETHEREUM',
   avalanche: 'EXPLORER_AVALANCHE',
   optimism: 'EXPLORER_OPTIMISM',
+  xlayer: 'EXPLORER_XLAYER',
 };
 
 export function getExplorerTxUrl(chainKey: ChainKey, txHash: string): string {

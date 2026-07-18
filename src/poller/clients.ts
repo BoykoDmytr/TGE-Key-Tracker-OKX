@@ -5,7 +5,7 @@
 // POLLER_RPCS_<CHAIN> (comma-separated). The bot's existing RPC_<CHAIN> is tried first.
 
 import { createPublicClient, http, fallback } from 'viem';
-import { bsc, base, arbitrum, mainnet, avalanche, optimism } from 'viem/chains';
+import { bsc, base, arbitrum, mainnet, avalanche, optimism, xLayer } from 'viem/chains';
 import type { ChainKey } from '../evm/provider.js';
 
 const CHAIN: Record<string, any> = {
@@ -15,6 +15,7 @@ const CHAIN: Record<string, any> = {
   ethereum: mainnet,
   avalanche,
   optimism,
+  xlayer: xLayer,
 };
 
 // Reliable public defaults (publicnode first — survived our HTML-on-ratelimit test).
@@ -25,6 +26,7 @@ const DEFAULT_RPCS: Record<string, string[]> = {
   ethereum:  ['https://ethereum-rpc.publicnode.com', 'https://eth.drpc.org', 'https://rpc.ankr.com/eth'],
   avalanche: ['https://avalanche-c-chain-rpc.publicnode.com', 'https://api.avax.network/ext/bc/C/rpc'],
   optimism:  ['https://optimism-rpc.publicnode.com', 'https://mainnet.optimism.io', 'https://optimism.drpc.org'],
+  xlayer:    ['https://rpc.xlayer.tech', 'https://xlayerrpc.okx.com', 'https://xlayer.drpc.org'],
 };
 
 function rpcsFor(chain: ChainKey): string[] {

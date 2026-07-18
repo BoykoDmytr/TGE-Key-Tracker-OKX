@@ -22,6 +22,7 @@ function prettyNetwork(chainKey: ChainKey): string {
     case 'ethereum': return 'Ethereum';
     case 'avalanche': return 'Avalanche';
     case 'optimism': return 'Optimism';
+    case 'xlayer': return 'X Layer';
     default: return chainKey;
   }
 }

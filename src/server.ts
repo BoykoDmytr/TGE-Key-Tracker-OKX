@@ -382,8 +382,10 @@ function normalizeTenderlyNetwork(net: string): ChainKey | null {
   if (n === '1') return 'ethereum';        // нове: Ethereum Mainnet
   if (n === '43114') return 'avalanche';   // нове: Avalanche C‑Chain
   if (n === '10') return 'optimism';       // нове: Optimism
+  if (n === '196') return 'xlayer';        // нове: X Layer (OKX zkEVM)
 
   // Текстові формати
+  if (n.includes('xlayer') || n.includes('x-layer') || n.includes('x layer')) return 'xlayer';
   if (n.includes('bsc') && n.includes('test')) return 'bsc_testnet';
   if (n.includes('bsc') || n.includes('bnb')) return 'bsc';
   if (n.includes('base')) return 'base';

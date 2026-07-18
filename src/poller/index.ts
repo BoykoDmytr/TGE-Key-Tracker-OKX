@@ -23,14 +23,23 @@ const DEFAULT_CONF: Record<string, number> = {
   arbitrum: 15,
   avalanche: 2,
   optimism: 8,
+  xlayer: 12,
 };
 
-const ALL_CHAINS: ChainKey[] = ['bsc', 'base', 'arbitrum', 'ethereum', 'avalanche', 'optimism'];
+const ALL_CHAINS: ChainKey[] = ['bsc', 'base', 'arbitrum', 'ethereum', 'avalanche', 'optimism', 'xlayer'];
 
 const INTERVAL = Number(process.env.POLLER_INTERVAL_MS || 4000);
 const MAX_BATCH = Number(process.env.POLLER_MAX_BATCH || 300);
 const CONCURRENCY = Number(process.env.POLLER_BLOCK_CONCURRENCY || 6);
 const SHADOW = process.env.POLLER_SHADOW === '1';
+// Per-chain shadow: chains listed here stay silent (detect+log, never post) even when
+// the global poller is live. Lets a NEW chain soak in shadow while the rest run live.
+const SHADOW_CHAINS = new Set(
+  (process.env.POLLER_SHADOW_CHAINS || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean),
+);
+function isShadow(chain: ChainKey): boolean {
+  return SHADOW || SHADOW_CHAINS.has(chain);
+}
 const DEPOSITS_ENABLED = process.env.POLLER_DEPOSITS !== '0'; // default on
 // Persist the cursor to Redis at most this often (keeps Upstash command count low).
 // In-memory cursor still advances every block; we also force-persist right after any
@@ -176,7 +185,7 @@ async function scanBlock(chain: ChainKey, block: any): Promise<boolean> {
       try {
         const r = await processSetTimeTx(
           { chainKey: chain, txHash: tx.hash, to, input },
-          { notify: !SHADOW, source: 'poller' },
+          { notify: !isShadow(chain), source: 'poller' },
         );
         if (r?.sent) matched = true; // we actually posted -> force a checkpoint
       } catch (e: any) {
@@ -185,8 +194,8 @@ async function scanBlock(chain: ChainKey, block: any): Promise<boolean> {
     } else if (DEPOSITS_ENABLED && sel === CREATE_DISTRIBUTOR_SELECTOR && to && facs.has(to)) {
       try {
         const r = await processDepositTx(chain, tx.hash, getPollerClient(chain), {
-          notify: !SHADOW,
-          persist: !SHADOW,
+          notify: !isShadow(chain),
+          persist: !isShadow(chain),
           source: 'poller',
           blockTimestamp: blockTs,
         });
