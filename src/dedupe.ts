@@ -26,6 +26,36 @@ function memMark(key: string): void {
   }
 }
 
+/**
+ * Atomically claim the right to send exactly one message for `key`.
+ * Returns true only for the caller that won the claim.
+ *
+ * ALWAYS claim BEFORE sending, never after. The old order (send -> mark) meant a crash,
+ * a 429, or a restart between the two re-sent the message. A claim means "attempted
+ * exactly once" — it is deliberately NOT released on send failure, because re-posting
+ * after a rate-limit is precisely what turned the 2026-08-05 incident into a flood.
+ */
+export async function claimOnce(key: string, ttlSec: number = TTL_SEC): Promise<boolean> {
+  const redis = getRedis();
+  if (!redis) {
+    // In-memory fallback: single instance only, lost on restart. Loud on purpose —
+    // without Redis the "exactly once" guarantee does not survive a restart.
+    console.warn('[dedupe] NO REDIS — claim is in-memory only, not restart-safe:', key);
+    if (memIsDup(key)) return false;
+    memMark(key);
+    return true;
+  }
+  try {
+    const res = await redis.set(`tge:dedup:${key}`, '1', 'EX', ttlSec, 'NX');
+    return res === 'OK';
+  } catch (err: any) {
+    console.error('[dedupe] claimOnce redis error, falling back to memory:', err?.message || err);
+    if (memIsDup(key)) return false;
+    memMark(key);
+    return true;
+  }
+}
+
 export async function isDuplicate(key: string): Promise<boolean> {
   const redis = getRedis();
   if (!redis) return memIsDup(key);

@@ -19,7 +19,8 @@ import { formatSetTimeMessage } from './telegram/formatSetTime.js';
 
 import { processSetTimeTx, processDepositTx } from './handlers.js';
 import { addFactory, listFactories } from './store/factories.js';
-import { startPoller } from './poller/index.js';
+import { startPoller, isShadow } from './poller/index.js';
+import { breakerStatus, resetBreaker } from './telegram.js';
 import { startSolanaPoller } from './poller-solana/index.js';
 
 // Admin endpoints accept EVM chain keys plus 'solana' (Solana allowlist / program list).
@@ -207,9 +208,10 @@ app.post('/webhooks/tenderly', express.raw({ type: 'application/json' }), async 
       return res.status(200).send('ok');
     }
 
-    // Process deposit (transfers -> threshold -> notify -> addTracked) via shared handler.
+    // Process deposit via the shared handler. notify honours shadow mode — previously this
+    // was hardcoded true, so POLLER_SHADOW=1 muted the poller but NOT this route.
     const { sent, tracked } = await processDepositTx(chainKey, txHash, client, {
-      notify: true,
+      notify: !isShadow(chainKey),
       persist: true,
       source: 'webhook',
       log: req.log as any,
@@ -226,7 +228,10 @@ app.post('/webhooks/tenderly', express.raw({ type: 'application/json' }), async 
       },
       'Error handling webhook',
     );
-    return res.status(500).send('error');
+    // 200 on purpose: a 500 makes the sender retry, which re-fetches the receipt and
+    // re-walks it. During an incident every call 500s and every retry compounds the
+    // flood. The poller re-scans the same blocks anyway, so nothing is truly lost.
+    return res.status(200).send('error-logged');
   }
 });
 
@@ -250,14 +255,14 @@ app.post('/webhooks/settime', express.json(), async (req: Request, res: Response
     // Decode + allowlist + dedup + send via shared handler (same path the poller uses).
     const r = await processSetTimeTx(
       { chainKey, txHash: String(tx_hash), to: String(to), input: String(input) },
-      { notify: true, source: 'webhook', log: req.log as any },
+      { notify: !isShadow(chainKey), source: 'webhook', log: req.log as any },
     );
 
     req.log.info({ chainKey, to, tx_hash, result: r }, 'settime processed');
     return res.status(200).send('ok');
   } catch (err: any) {
     (req as any).log?.error?.({ err: err?.message || err }, 'settime webhook error');
-    return res.status(500).send('error');
+    return res.status(200).send('error-logged'); // see the deposit route: no retry amplification
   }
 });
 
@@ -355,6 +360,24 @@ app.get('/admin/factory', async (req: Request, res: Response) => {
   const chain = normalizeAdminChain(String(req.query.chain || ''));
   if (!chain) return res.status(400).send('bad/missing chain');
   return res.json({ chain, factories: await listFactories(chain) });
+});
+
+// ====== ADMIN: Telegram circuit breaker ======
+app.get('/admin/tg', (req: Request, res: Response) => {
+  const secret = req.header('x-admin-secret') || '';
+  if (!process.env.ADMIN_SECRET || secret !== process.env.ADMIN_SECRET) {
+    return res.status(401).send('unauthorized');
+  }
+  return res.json(breakerStatus());
+});
+
+app.post('/admin/tg/reset', (req: Request, res: Response) => {
+  const secret = req.header('x-admin-secret') || '';
+  if (!process.env.ADMIN_SECRET || secret !== process.env.ADMIN_SECRET) {
+    return res.status(401).send('unauthorized');
+  }
+  resetBreaker();
+  return res.json({ ok: true, status: breakerStatus() });
 });
 
 // ====== START ======

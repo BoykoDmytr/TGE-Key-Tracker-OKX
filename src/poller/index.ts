@@ -37,7 +37,7 @@ const SHADOW = process.env.POLLER_SHADOW === '1';
 const SHADOW_CHAINS = new Set(
   (process.env.POLLER_SHADOW_CHAINS || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean),
 );
-function isShadow(chain: ChainKey): boolean {
+export function isShadow(chain: ChainKey): boolean {
   return SHADOW || SHADOW_CHAINS.has(chain);
 }
 const DEPOSITS_ENABLED = process.env.POLLER_DEPOSITS !== '0'; // default on
@@ -131,7 +131,15 @@ async function runChainLoop(chain: ChainKey): Promise<void> {
           let matched = false;
           for (let i = 0; i < blocks.length; i++) {
             if (!blocks[i]) break; // leave cursor before the missing block; retry next tick
-            if (await scanBlock(chain, blocks[i])) matched = true;
+            const r = await scanBlock(chain, blocks[i]);
+            if (r.matched) matched = true;
+            // A trigger we recognised but failed to process must NOT be skipped: stop
+            // before this block so the next tick retries it. Previously the cursor
+            // advanced anyway and the event was lost in-process forever.
+            if (r.failed) {
+              console.error('[poller:%s] block %d had a failed handler — holding cursor at %d', chain, batch[i], advanceTo);
+              break;
+            }
             advanceTo = batch[i];
           }
           if (advanceTo > cursor) {
@@ -170,10 +178,11 @@ async function fetchBlock(client: any, chain: ChainKey, n: number): Promise<any 
 
 // Returns true if the block contained a setTime or tracked-factory deposit we handled
 // (used to force a cursor checkpoint so a restart never re-posts it).
-async function scanBlock(chain: ChainKey, block: any): Promise<boolean> {
+async function scanBlock(chain: ChainKey, block: any): Promise<{ matched: boolean; failed: boolean }> {
   const facs = factoriesFor(chain);
   const blockTs = Number(block.timestamp);
   let matched = false;
+  let failed = false;
 
   for (const tx of block.transactions || []) {
     const input: string = (tx.input || '0x') as string;
@@ -189,6 +198,7 @@ async function scanBlock(chain: ChainKey, block: any): Promise<boolean> {
         );
         if (r?.sent) matched = true; // we actually posted -> force a checkpoint
       } catch (e: any) {
+        failed = true;
         console.error('[poller:%s] setTime handler error %s: %s', chain, tx.hash, e?.message || e);
       }
     } else if (DEPOSITS_ENABLED && sel === CREATE_DISTRIBUTOR_SELECTOR && to && facs.has(to)) {
@@ -199,11 +209,14 @@ async function scanBlock(chain: ChainKey, block: any): Promise<boolean> {
           source: 'poller',
           blockTimestamp: blockTs,
         });
-        if (r && r.sent > 0) matched = true; // we actually posted -> force a checkpoint
+        // Checkpoint on any durable side effect, not just a post: a tracked distributor
+        // or a capped tx is state we must not redo on restart.
+        if (r && (r.sent > 0 || r.tracked > 0 || r.capped)) matched = true;
       } catch (e: any) {
+        failed = true;
         console.error('[poller:%s] deposit handler error %s: %s', chain, tx.hash, e?.message || e);
       }
     }
   }
-  return matched;
+  return { matched, failed };
 }
