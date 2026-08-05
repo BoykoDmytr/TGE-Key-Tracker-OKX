@@ -205,7 +205,13 @@ async function scanBlock(chain: ChainKey, block: any): Promise<{ matched: boolea
       try {
         const r = await processDepositTx(chain, tx.hash, getPollerClient(chain), {
           notify: !isShadow(chain),
-          persist: !isShadow(chain),
+          // ALWAYS persist, even in shadow. Shadow means "don't post", not "don't learn".
+          // The tracked allowlist is only read by the setTime gate, which is muted in shadow
+          // anyway, so persisting is invisible to subscribers. Gating it on shadow meant a
+          // soak silently produced a PERMANENT setTime blackout: distributors seen during
+          // the soak never entered the allowlist, and their setTime (which lands days later,
+          // and is the higher-value alert) was dropped forever as 'non-tracked'.
+          persist: true,
           source: 'poller',
           blockTimestamp: blockTs,
         });

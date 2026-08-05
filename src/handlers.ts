@@ -6,7 +6,7 @@ import { type ChainKey, getExplorerTxUrl } from './evm/provider.js';
 import { getErc20MetaCached, formatUnitsSafe } from './evm/erc20MetaCache.js';
 import { extractDistributorCreated, sumTransfersTo } from './evm/parseFactoryEvents.js';
 import { loadFactories, factoriesFor } from './store/factories.js';
-import { isDuplicate, markDuplicate, claimOnce } from './dedupe.js';
+import { isDuplicate, claimOnce } from './dedupe.js';
 import { sendTelegram, notifyOwner } from './telegram.js';
 import { formatNumberWithCommas } from './utils/formatNumberWithCommas.js';
 import { addTracked, getTracked } from './store/trackedDistributors.js';
