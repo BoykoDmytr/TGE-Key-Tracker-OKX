@@ -21,12 +21,11 @@ import { processSetTimeTx, processDepositTx } from './handlers.js';
 import { addFactory, listFactories } from './store/factories.js';
 import { startPoller, isShadow } from './poller/index.js';
 import { breakerStatus, resetBreaker } from './telegram.js';
-import { startSolanaPoller } from './poller-solana/index.js';
-
-// Admin endpoints accept EVM chain keys plus 'solana' (Solana allowlist / program list).
+// Solana support was removed 2026-08-05 (product decision: we do not track that network).
+// The poller, its RPC/metadata helpers and @solana/web3.js are gone; 'solana' is no longer
+// an accepted admin chain, so a stray /admin/factory {chain:"solana"} cannot resurrect it.
 function normalizeAdminChain(net: string): string | null {
   const n = String(net).toLowerCase().trim();
-  if (n === 'solana' || n === 'sol') return 'solana';
   return normalizeTenderlyNetwork(n);
 }
 
@@ -381,17 +380,16 @@ app.post('/admin/tg/reset', (req: Request, res: Response) => {
 });
 
 // ====== START ======
-console.log('[boot] POLLER_ENABLED=%s POLLER_SHADOW=%s POLLER_CHAINS=%s FACTORIES_DEFAULT=%s POLLER_SOLANA=%s POLLER_SOLANA_SHADOW=%s',
+console.log('[boot] POLLER_ENABLED=%s POLLER_SHADOW=%s POLLER_SHADOW_CHAINS=%s POLLER_CHAINS=%s FACTORIES_DEFAULT=%s',
   process.env.POLLER_ENABLED || '0', process.env.POLLER_SHADOW || '0',
+  process.env.POLLER_SHADOW_CHAINS || '(none)',
   process.env.POLLER_CHAINS || process.env.CHAINS || '(none)',
-  process.env.FACTORIES_DEFAULT ? '(set)' : '(not set)',
-  process.env.POLLER_SOLANA || '0', process.env.POLLER_SOLANA_SHADOW || '0');
+  process.env.FACTORIES_DEFAULT ? '(set)' : '(not set)');
 
 const port = Number(process.env.PORT || 8080);
 app.listen(port, () => {
   console.log(`Listening on :${port}`);
   startPoller();
-  startSolanaPoller();
 });
 
 function normalizeTenderlyNetwork(net: string): ChainKey | null {
