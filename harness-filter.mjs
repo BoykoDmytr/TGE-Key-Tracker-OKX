@@ -15,6 +15,8 @@ process.env.THRESHOLDS_JSON = '{}';
 process.env.FACTORIES_DEFAULT =
   '0x000310fa98E36191ec79de241d72C6CA093EAFd3,0x00306cEfc385c8767cA580913a3F88319a343FC0';
 process.env.FILTER_MODE = 'shadow';   // decide + log, change nothing
+// ALLOWLIST MODE: X Layer is judged only by its token allowlist; other chains keep the
+// heuristic path. FILTER_CHAINS is what actually scopes enforcement in prod.
 
 const { processDepositTx } = await import('./dist/handlers.js');
 const { getPollerClient } = await import('./dist/poller/clients.js');
@@ -23,10 +25,10 @@ const { classifyDeposit } = await import('./dist/filter/spamFilter.js');
 // [chain, tx, expectedVerdict, label]
 const CASES = [
   // --- spam that reached the channel and must not again ---
-  ['xlayer', '0x08e590e10f7c2851facc369ae4291575671ee941b0a780f1182edb8e825bf874', 'spam', 'OKOX 100k (02.09)'],
+  ['xlayer', '0x08e590e10f7c2851facc369ae4291575671ee941b0a780f1182edb8e825bf874', 'unsure', 'OKOX 100k -> DM (not allowlisted)'],
   ['bsc',    '0xa0869f508c8bf00be098662708077daa282284d47eb8e842d194c030bc38102b', 'spam', 'LISTA BANK 10k (02.09)'],
-  ['xlayer', '0x005de7e37b12febf0f6e3d894ee7ba15c84f82cbfc3981b2bc849dfdf28afa10', 'spam', 'OEOE 5k (03.09)'],
-  ['xlayer', '0x82b5bfd1068ad4b41759a72a81809daa39948c8adab1ac68fb336166bffbb16e', 'spam', 'DOG 19.8k (05.08 flood)'],
+  ['xlayer', '0x005de7e37b12febf0f6e3d894ee7ba15c84f82cbfc3981b2bc849dfdf28afa10', 'unsure', 'OEOE 5k -> DM (not allowlisted)'],
+  ['xlayer', '0x82b5bfd1068ad4b41759a72a81809daa39948c8adab1ac68fb336166bffbb16e', 'unsure', 'DOG 19.8k -> DM (not allowlisted)'],
   // --- real campaigns that must keep posting ---
   ['bsc',    '0x036de29262552683b323d18f04d1980895e69b7f941c584dd341e28a93e49eae', 'legit', 'KII 5.4M — PRE-TGE, no market'],
   ['base',   '0xa47d26839305f41ca8d1316ccda63e5854ec4108961a09c1ec095be7ce9f6501', 'legit', 'CP 17M — pre-market'],
@@ -59,7 +61,9 @@ for (const [chain, tx, want, label] of CASES) {
 // --- unit checks that need no chain: the creator rule and the guards ---
 console.log('\n=== unit: creator history and evidence guards ===');
 const base = {
-  chainKey: 'xlayer', token: '0xdead', creator: '0xc0ffee', operator: '0x7a39c61a',
+  // 'bsc' has no allowlist, so these exercise the heuristic path (inert in prod while
+  // FILTER_CHAINS=xlayer, kept so the fallback stays proven if another chain is enabled).
+  chainKey: 'bsc', token: '0xdead', creator: '0xc0ffee', operator: '0x7a39c61a',
   landed: 10n ** 22n, balance: 10n ** 22n, totalSupply: 10n ** 24n, decimals: 18, creatorPriors: 0, balanceCheckable: true,
 };
 const units = [
@@ -73,6 +77,9 @@ const units = [
   ['ZAMA-shaped: serial creator BUT big share -> unsure, never spam', { ...base, creatorPriors: 9 }, 'unsure'],
   ['blocklisted creator with big share -> unsure, never spam', { ...base, creator: '0x2c825edb17c2c04983a481ebd2da2a39424c7cb7' }, 'unsure'],
   ['blocklisted creator with dust share -> spam', { ...base, creator: '0x2c825edb17c2c04983a481ebd2da2a39424c7cb7', landed: 10n ** 16n }, 'spam'],
+  ['allowlist: unknown xlayer token -> unsure (DM), never auto-post', { ...base, chainKey: 'xlayer', token: '0xbeef' }, 'unsure'],
+  ['allowlist: USD0 on xlayer -> legit', { ...base, chainKey: 'xlayer', token: '0x779ded0c9e1022225f8e0630b35a9b54be713736' }, 'legit'],
+  ['allowlist: fake USDT symbol, wrong address -> unsure', { ...base, chainKey: 'xlayer', token: '0x1111111111111111111111111111111111111111' }, 'unsure'],
 ];
 for (const [name, inp, want] of units) {
   const r = classifyDeposit(inp);

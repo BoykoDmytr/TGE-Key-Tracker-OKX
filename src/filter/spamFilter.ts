@@ -90,6 +90,45 @@ const DEFAULT_STABLES: Record<string, string[]> = {
   ],
 };
 
+/**
+ * PER-CHAIN TOKEN ALLOWLIST — the simplest rule that solves the actual problem.
+ *
+ * The spam is confined to X Layer, and every legitimate X Layer deposit in the bot's
+ * entire history was a stablecoin: 12 deposits over the 5000-token floor, 8 legitimate
+ * (USD₮0 x6, USDC, USDG) and 4 spam (OKOX x2, DOG, OEOE). Even the AIW3 X Launch on
+ * X Layer was funded in USD₮0 — OKX funds campaigns on its own chain in stablecoins.
+ * So on X Layer a three-address allowlist separates them perfectly, with no RPC call,
+ * no heuristic and no added latency.
+ *
+ * A chain with an allowlist is judged ONLY by it. A chain without one is not touched at
+ * all (see filterAppliesTo). Anything not on the list goes to the owner for one tap —
+ * never silently dropped.
+ */
+const DEFAULT_ALLOWLIST: Record<string, string[]> = {
+  xlayer: [
+    '0x779ded0c9e1022225f8e0630b35a9b54be713736', // USD₮0 — 6 of the 8 legit deposits
+    '0x4ae46a509f6b1d9056937ba4500cb143933d2dc8', // USDG  — RWA season competitions
+    '0x74b7f16337b8972027f6196a17a631ac6de26d22', // USDC
+  ],
+};
+
+/** Returns null when this chain has no allowlist (then it is not allowlist-judged). */
+export function allowlistFor(chain: ChainKey): Set<string> | null {
+  let cfg: Record<string, string[]> = DEFAULT_ALLOWLIST;
+  const raw = process.env.FILTER_ALLOWLIST_JSON;
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') cfg = parsed;
+    } catch {
+      console.error('[filter] FILTER_ALLOWLIST_JSON is malformed — using the built-in list');
+    }
+  }
+  const list = cfg[chain];
+  if (!Array.isArray(list) || list.length === 0) return null;
+  return new Set(list.map((a) => String(a).toLowerCase()));
+}
+
 function stablesFor(chain: ChainKey): Set<string> {
   const out = new Set((DEFAULT_STABLES[chain] || []).map((a) => a.toLowerCase()));
   // FILTER_STABLE_TOKENS_JSON = {"xlayer":["0x…"],"bsc":["0x…"]} — additive, never replaces
@@ -147,6 +186,19 @@ export function classifyDeposit(inp: FilterInput): FilterResult {
   }
 
   const sharePpb = (landed * 1_000_000_000n) / totalSupply;
+
+  // ---- 1b. Allowlisted chain: the list is the whole decision. Matched BY ADDRESS —
+  // symbol() is a string the spammer's own contract returns, so "USDT" proves nothing.
+  const allow = allowlistFor(inp.chainKey);
+  if (allow) {
+    if (allow.has(inp.token.toLowerCase())) {
+      return { verdict: 'legit', rule: 'allowlist', detail: 'token is on the allowlist for this chain', sharePpb };
+    }
+    return {
+      verdict: 'unsure', rule: 'not-allowlisted',
+      detail: 'token is not on the allowlist for this chain', sharePpb,
+    };
+  }
 
   // ---- 2. Stablecoins are exempt from the share test: a campaign funded in USDT is a
   // rounding error of the stablecoin's supply by definition (USDG sat at 27_300 ppb).
