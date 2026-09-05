@@ -34,6 +34,12 @@ const ZERO_ADDR = '0x0000000000000000000000000000000000000000';
 
 export interface DistributorCreatedEvent {
   factory: string;
+  /** topics[1] — the wallet that CALLED createDistributor. A third party cannot write this
+   *  about someone else, which is why the spam filter keys its creator history on it. */
+  creator: string;
+  /** topics[2] — the operator ARGUMENT the caller passed in. Anyone may name any address
+   *  here, so it may DOWNGRADE trust, never establish it. */
+  operator: string;
   token: Hex;
   distributor: Hex;
   /** amount as declared by the factory event. NEW factory only; null on OLD. */
@@ -136,7 +142,10 @@ export function extractDistributorCreated(
       }
     }
 
-    events.push({ factory: addr, token, distributor, declaredAmount, logIndex, variant: spec.label });
+    const creator = topics[1] ? (`0x${String(topics[1]).slice(26)}`).toLowerCase() : '';
+    const operator = topics[2] ? (`0x${String(topics[2]).slice(26)}`).toLowerCase() : '';
+
+    events.push({ factory: addr, creator, operator, token, distributor, declaredAmount, logIndex, variant: spec.label });
   }
 
   events.sort((a, b) => a.logIndex - b.logIndex);

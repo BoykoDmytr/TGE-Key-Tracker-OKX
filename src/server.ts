@@ -20,7 +20,8 @@ import { formatSetTimeMessage } from './telegram/formatSetTime.js';
 import { processSetTimeTx, processDepositTx } from './handlers.js';
 import { addFactory, listFactories } from './store/factories.js';
 import { startPoller, isShadow } from './poller/index.js';
-import { breakerStatus, resetBreaker } from './telegram.js';
+import { breakerStatus, resetBreaker, answerCallback, editOwnerMarkup, OWNER_CHAT_ID } from './telegram.js';
+import { takePending } from './filter/pendingApproval.js';
 // Solana support was removed 2026-08-05 (product decision: we do not track that network).
 // The poller, its RPC/metadata helpers and @solana/web3.js are gone; 'solana' is no longer
 // an accepted admin chain, so a stray /admin/factory {chain:"solana"} cannot resurrect it.
@@ -359,6 +360,62 @@ app.get('/admin/factory', async (req: Request, res: Response) => {
   const chain = normalizeAdminChain(String(req.query.chain || ''));
   if (!chain) return res.status(400).send('bad/missing chain');
   return res.json({ chain, factories: await listFactories(chain) });
+});
+
+// ====== Telegram callback: the owner approving a withheld post ======
+// Registered with setWebhook + a secret token. Three independent checks before anything
+// can reach the channel: the URL path secret, the Telegram secret-token header, and the
+// sender's Telegram user id. A withheld post is published only by the owner, by hand.
+app.post('/tg/callback/:secret', express.json(), async (req: Request, res: Response) => {
+  // Always 200: a non-200 makes Telegram retry the same update forever.
+  try {
+    const want = process.env.TG_WEBHOOK_SECRET || process.env.ADMIN_SECRET || "";
+    if (!want || req.params.secret !== want) return res.status(200).send("ok");
+    const hdr = req.header("x-telegram-bot-api-secret-token") || "";
+    if (process.env.TG_WEBHOOK_SECRET && hdr !== process.env.TG_WEBHOOK_SECRET) {
+      return res.status(200).send("ok");
+    }
+
+    const cq = (req.body || {}).callback_query;
+    if (!cq) return res.status(200).send("ok");
+
+    // Only the owner may publish. Anyone else tapping is ignored silently.
+    if (String(cq.from?.id || "") !== String(OWNER_CHAT_ID)) {
+      await answerCallback(cq.id, "Not authorised");
+      return res.status(200).send("ok");
+    }
+
+    const data = String(cq.data || "");
+    const msgId = cq.message?.message_id;
+    const m = /^(ap|no):([0-9a-f]{16})$/.exec(data);
+    if (!m) { await answerCallback(cq.id, "Expired"); return res.status(200).send("ok"); }
+
+    const [, action, id] = m;
+    const rec = await takePending(id);   // atomic: a second tap finds nothing
+    if (!rec) {
+      await answerCallback(cq.id, "Already handled or expired");
+      if (msgId) await editOwnerMarkup(msgId, "\u2014 already handled");
+      return res.status(200).send("ok");
+    }
+
+    if (action === "no") {
+      await answerCallback(cq.id, "Discarded");
+      if (msgId) await editOwnerMarkup(msgId, "\u{1F5D1} discarded");
+      console.log("[approve] discarded %s %s %s", rec.chain, rec.kind, rec.distributor);
+      return res.status(200).send("ok");
+    }
+
+    // Approve. The automatic path already claimed this dedupe key before withholding, so
+    // publishing here cannot race a later automatic post of the same event.
+    await sendTelegram(rec.message);
+    await answerCallback(cq.id, "Posted to channel");
+    if (msgId) await editOwnerMarkup(msgId, "\u2705 posted to channel");
+    console.log("[approve] published %s %s %s (rule %s)", rec.chain, rec.kind, rec.distributor, rec.rule);
+    return res.status(200).send("ok");
+  } catch (err: any) {
+    console.error("[approve] callback failed:", err?.message || err);
+    return res.status(200).send("ok");
+  }
 });
 
 // ====== ADMIN: Telegram circuit breaker ======

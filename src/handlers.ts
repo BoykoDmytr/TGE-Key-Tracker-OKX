@@ -7,9 +7,12 @@ import { getErc20MetaCached, formatUnitsSafe } from './evm/erc20MetaCache.js';
 import { extractDistributorCreated, sumTransfersTo } from './evm/parseFactoryEvents.js';
 import { loadFactories, factoriesFor } from './store/factories.js';
 import { isDuplicate, claimOnce } from './dedupe.js';
-import { sendTelegram, notifyOwner } from './telegram.js';
+import { sendTelegram, notifyOwner, notifyOwnerWithButtons } from './telegram.js';
 import { formatNumberWithCommas } from './utils/formatNumberWithCommas.js';
-import { addTracked, getTracked } from './store/trackedDistributors.js';
+import { addTracked, getTracked, trackedVerdict } from './store/trackedDistributors.js';
+import { classifyDeposit, filterMode, filterAppliesTo, type Verdict } from './filter/spamFilter.js';
+import { newPendingId, putPending } from './filter/pendingApproval.js';
+import { noteCreator, creatorPriorCount } from './store/creatorIndex.js';
 import { decodeSetTime } from './evm/decodeSetTime.js';
 import { formatSetTimeMessage } from './telegram/formatSetTime.js';
 
@@ -88,6 +91,23 @@ export async function processSetTimeTx(
   // whenever the send threw or the process restarted in between.
   if (!(await claimOnce(dedupeKey))) return { sent: false, reason: 'dup' };
 
+  // settime-inherits-verdict: a distributor whose DEPOSIT we withheld must not announce
+  // its claim time either — otherwise the spam we filtered walks in through this door.
+  // Records written before the filter carry no verdict and resolve to legit, so nothing
+  // that already works changes.
+  const inherited = trackedVerdict(tracked);
+  if (filterMode() === 'enforce' && inherited !== 'legit') {
+    await routeToOwnerReview({
+      chainKey, distributor: String(to), message, dedupeKey,
+      kind: 'settime', verdict: inherited, rule: tracked.verdictRule || 'inherited',
+      detail: 'deposit for this distributor was withheld',
+      amountLine: (tracked.amountHuman ? tracked.amountHuman + ' ' : '') + (tracked.tokenSymbol || ''),
+      txHash: String(txHash),
+    });
+    logInfo(opts.log, { chainKey, to, txHash, verdict: inherited }, 'setTime withheld — sent to owner review');
+    return { sent: false, reason: 'withheld' };
+  }
+
   await sendTelegram(message);
   logInfo(opts.log, { chainKey, to, txHash, source: opts.source }, 'setTime notification sent');
   return { sent: true };
@@ -127,12 +147,52 @@ async function ensureFactories(chainKey: ChainKey): Promise<void> {
   } catch { /* keep whatever is already in memory */ }
 }
 
+const ERC20_FILTER_ABI = [
+  { type: 'function', name: 'totalSupply', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint256' }] },
+  { type: 'function', name: 'balanceOf', stateMutability: 'view', inputs: [{ type: 'address' }], outputs: [{ type: 'uint256' }] },
+] as const;
+
+/** Park a withheld post and DM the owner with an approve button. Never touches the channel. */
+async function routeToOwnerReview(args: {
+  chainKey: ChainKey; distributor: string; message: string; dedupeKey: string;
+  kind: 'deposit' | 'settime'; verdict: Verdict; rule: string; detail: string;
+  amountLine: string; txHash: string;
+}): Promise<void> {
+  const id = newPendingId();
+  const stored = await putPending(id, {
+    message: args.message, dedupeKey: args.dedupeKey, chain: args.chainKey,
+    distributor: args.distributor, kind: args.kind, verdict: args.verdict,
+    rule: args.rule, createdAt: Math.floor(Date.now() / 1000),
+  });
+
+  const head = args.verdict === 'spam' ? '\u{1F5D1} <b>Spam withheld</b>' : '\u2753 <b>Needs your call</b>';
+  // amountLine embeds the token symbol, chosen by the token contract. It is escaped here
+  // exactly as on the channel path; never interpolate it unescaped.
+  const body =
+    head + '\n\n' +
+    'Type: ' + (args.kind === 'deposit' ? 'DEPOSIT' : 'SET TIME') + '\n' +
+    'Amount: ' + escHtml(args.amountLine) + '\n' +
+    'Network: ' + escHtml(networkPretty(args.chainKey)) + '\n' +
+    'Reason: ' + escHtml(args.detail) + ' <code>[' + escHtml(args.rule) + ']</code>\n' +
+    '<a href="' + escHtml(getExplorerTxUrl(args.chainKey, args.txHash)) + '">View on Scan</a>' +
+    (stored ? '' : '\n\n\u26A0\uFE0F could not park the message \u2014 approve button unavailable');
+
+  if (stored) {
+    await notifyOwnerWithButtons(body, [[
+      { text: '\u2705 Post to channel', callback_data: 'ap:' + id },
+      { text: '\u{1F5D1} Discard', callback_data: 'no:' + id },
+    ]]);
+  } else {
+    await notifyOwner(body);
+  }
+}
+
 export async function processDepositTx(
   chainKey: ChainKey,
   txHash: string,
   client: any,
   opts: DepositOpts,
-): Promise<{ sent: number; tracked: number; capped?: boolean }> {
+): Promise<{ sent: number; tracked: number; capped?: boolean; withheld?: number }> {
   const receipt = await client.getTransactionReceipt({ hash: txHash as `0x${string}` });
 
   // A reverted tx creates nothing.
@@ -194,6 +254,7 @@ export async function processDepositTx(
   let tracked = 0;
 
   let capped = false;
+  let withheld = 0;
   const seenInTx = new Set<string>();
 
   for (const ev of events) {
@@ -210,6 +271,41 @@ export async function processDepositTx(
       const raw = landed > 0n ? landed : (ev.declaredAmount ?? null);
       const amountHuman = raw != null ? formatUnitsSafe(raw, meta.decimals) : '';
 
+      // ---- spam filter. FILTER_MODE=off (the default) short-circuits BEFORE any extra
+      // RPC call, so with the flag unset this path is byte-for-byte what it was before.
+      const mode = filterMode();
+      const filterOn = mode !== 'off' && filterAppliesTo(chainKey);
+      let verdict: Verdict = 'legit';
+      let vRule = 'filter-off';
+      let vDetail = '';
+
+      if (filterOn && raw != null) {
+        // balanceOf is read at the chain HEAD. That only corroborates the Transfer logs
+        // while the deposit is fresh — on a replay or backfill the tokens have since been
+        // claimed and a lower balance is entirely normal, so the comparison is disabled.
+        const ageSec = opts.blockTimestamp ? Math.floor(Date.now() / 1000) - opts.blockTimestamp : Number.MAX_SAFE_INTEGER;
+        const balanceCheckable = ageSec <= Number(process.env.FILTER_BALANCE_MAX_AGE_SEC || 600);
+        const [totalSupply, balance, priors] = await Promise.all([
+          client.readContract({ address: ev.token, abi: ERC20_FILTER_ABI, functionName: 'totalSupply' })
+            .then((v: any) => BigInt(v)).catch(() => null),
+          balanceCheckable
+            ? client.readContract({ address: ev.token, abi: ERC20_FILTER_ABI, functionName: 'balanceOf', args: [ev.distributor] })
+                .then((v: any) => BigInt(v)).catch(() => null)
+            : Promise.resolve(null),
+          creatorPriorCount(ev.creator),
+        ]);
+        const res = classifyDeposit({
+          chainKey, token: ev.token, creator: ev.creator, operator: ev.operator,
+          landed: raw, balance, totalSupply, decimals: meta.decimals, creatorPriors: priors,
+          balanceCheckable,
+        });
+        verdict = res.verdict; vRule = res.rule; vDetail = res.detail;
+        logInfo(opts.log, {
+          chainKey, distributor: ev.distributor, txHash, verdict, rule: vRule,
+          detail: vDetail, sharePpb: res.sharePpb?.toString() ?? null, mode,
+        }, 'FILTER verdict');
+      }
+
       // Track FIRST and unconditionally: a distributor below the post threshold is still a
       // real distributor, and if it is missing from the allowlist its future setTime is
       // silently dropped. (The old code `continue`d past addTracked on every filter.)
@@ -220,8 +316,14 @@ export async function processDepositTx(
           tokenAddress: ev.token,
           tokenSymbol: meta.symbol,
           amountHuman,
+          // The verdict rides on the record so the later setTime inherits it. Only
+          // 'enforce' writes a real verdict; off/shadow keep 'legit' = no change.
+          verdict: mode === 'enforce' ? verdict : 'legit',
+          verdictRule: vRule,
         });
         tracked++;
+        // Count this creator only AFTER classifying, so a deposit never counts itself.
+        await noteCreator(ev.creator, chainKey, ev.distributor);
       }
 
       // ---- posting gates (tracking already happened above) ----
@@ -267,6 +369,18 @@ export async function processDepositTx(
       const dedupeKey = `deposit:${chainKey}:${txHash.toLowerCase()}:${ev.logIndex}`;
       if (!(await claimOnce(dedupeKey))) continue;
 
+      // Only 'enforce' diverts. Anything the filter did not clear goes to the owner with an
+      // approve button rather than the channel — never silently dropped, because a missed
+      // real deposit costs subscribers just as much as spam does.
+      if (mode === 'enforce' && verdict !== 'legit') {
+        await routeToOwnerReview({
+          chainKey, distributor: ev.distributor, message, dedupeKey, kind: 'deposit',
+          verdict, rule: vRule, detail: vDetail, amountLine, txHash,
+        });
+        withheld++;
+        continue;
+      }
+
       await sendTelegram(message);
       sent++;
     } catch (e: any) {
@@ -283,5 +397,6 @@ export async function processDepositTx(
     );
   }
 
-  return { sent, tracked, capped };
+  if (withheld > 0) console.log('[handler] %s %s: %d deposit(s) sent to owner review', chainKey, txHash, withheld);
+  return { sent, tracked, capped, withheld };
 }

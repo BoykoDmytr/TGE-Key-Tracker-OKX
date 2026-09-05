@@ -12,6 +12,20 @@ export interface TrackedInfo {
   tokenAddress: string;
   tokenSymbol: string;
   amountHuman: string;
+  /** Spam-filter decision for the DEPOSIT that created this distributor. Absent on every
+   *  record written before the filter existed — read as 'legit' so nothing that used to
+   *  work stops working. The later setTime post inherits it, otherwise a spam deposit we
+   *  correctly withheld would still announce its claim time to the channel. */
+  verdict?: 'legit' | 'spam' | 'unsure';
+  /** Rule id behind the verdict — shown in the owner DM and kept for audit. */
+  verdictRule?: string;
+}
+
+/** Records with no verdict pre-date the filter and were already posted, so their setTime
+ *  must keep posting. Absent === 'legit', deliberately. */
+export function trackedVerdict(info: TrackedInfo | null): 'legit' | 'spam' | 'unsure' {
+  if (!info) return 'legit';
+  return info.verdict ?? 'legit';
 }
 
 function key(chain: string, address: string): string {

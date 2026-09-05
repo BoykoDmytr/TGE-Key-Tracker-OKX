@@ -2,6 +2,10 @@
 // Each must still produce EXACTLY 1 message with the amount recorded in Redis.
 // Covers both factories (OLD has no amount in its event) across 5 chains.
 delete process.env.REDIS_URL;
+// HARD GUARD: this harness must never be able to reach a channel.
+if (String(process.env.TELEGRAM_CHAT_ID||'').startsWith('-100')) { console.error('REFUSING: TELEGRAM_CHAT_ID looks like a real channel'); process.exit(1); }
+delete process.env.ANTHROPIC_API_KEY;
+delete process.env.FILTER_MODE;
 delete process.env.TELEGRAM_BOT_TOKEN;
 delete process.env.TELEGRAM_CHAT_ID;
 process.env.THRESHOLDS_JSON = '{}';

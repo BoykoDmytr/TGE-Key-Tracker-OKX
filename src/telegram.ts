@@ -66,7 +66,7 @@ export function resetBreaker(): void {
 }
 
 /** Raw one-shot POST. Throws on failure — only the worker calls this. */
-async function postMessage(chatId: string, text: string, silent: boolean): Promise<void> {
+async function postMessage(chatId: string, text: string, silent: boolean, replyMarkup?: unknown): Promise<void> {
   const botToken = requireEnv('TELEGRAM_BOT_TOKEN');
   const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
     method: 'POST',
@@ -77,6 +77,7 @@ async function postMessage(chatId: string, text: string, silent: boolean): Promi
       parse_mode: 'HTML',
       disable_web_page_preview: true,
       ...(silent ? { disable_notification: true } : {}),
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
     }),
     signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
   });
@@ -99,6 +100,58 @@ export async function notifyOwner(text: string): Promise<void> {
     console.error('[telegram] owner DM failed:', e?.message || e);
   }
 }
+
+/**
+ * DM the owner with inline buttons (the approve/discard flow for filtered deposits).
+ * Never throws, never touches the channel, never goes through the channel queue — the
+ * owner's DM must keep working even when the channel breaker is open.
+ */
+export async function notifyOwnerWithButtons(
+  text: string,
+  buttons: Array<Array<{ text: string; callback_data: string }>>,
+): Promise<void> {
+  try {
+    await postMessage(OWNER_CHAT_ID, text, true, { inline_keyboard: buttons });
+  } catch (e: any) {
+    console.error('[telegram] owner DM (buttons) failed:', e?.message || e);
+  }
+}
+
+/** Answer a callback_query so Telegram stops showing the spinner on the button. */
+export async function answerCallback(callbackQueryId: string, text: string): Promise<void> {
+  try {
+    const botToken = requireEnv('TELEGRAM_BOT_TOKEN');
+    await fetch(`https://api.telegram.org/bot${botToken}/answerCallbackQuery`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ callback_query_id: callbackQueryId, text: text.slice(0, 200) }),
+      signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+    });
+  } catch (e: any) {
+    console.error('[telegram] answerCallbackQuery failed:', e?.message || e);
+  }
+}
+
+/** Replace the buttons on an owner DM after it has been acted on, so it cannot be
+ *  double-approved by tapping again. Best effort. */
+export async function editOwnerMarkup(messageId: number, note: string): Promise<void> {
+  try {
+    const botToken = requireEnv('TELEGRAM_BOT_TOKEN');
+    await fetch(`https://api.telegram.org/bot${botToken}/editMessageReplyMarkup`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: OWNER_CHAT_ID, message_id: messageId,
+        reply_markup: { inline_keyboard: [[{ text: note, callback_data: 'noop' }]] },
+      }),
+      signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+    });
+  } catch (e: any) {
+    console.error('[telegram] editMessageReplyMarkup failed:', e?.message || e);
+  }
+}
+
+export { OWNER_CHAT_ID };
 
 function openBreaker(reason: string): void {
   breakerOpenUntil = Date.now() + BREAKER_COOLDOWN_MS;
