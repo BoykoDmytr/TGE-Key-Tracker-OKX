@@ -54,3 +54,32 @@ export async function getTracked(chain: string, address: string): Promise<Tracke
     return null;
   }
 }
+
+/**
+ * Promote a tracked distributor to verdict=legit.
+ *
+ * Called when the owner approves a withheld deposit. Without this the deposit is
+ * published but the record still says 'unsure', so the distributor's later setTime is
+ * withheld too and has to be approved a second time — which is exactly what happened
+ * with the 300,000 USDC campaign on 2026-09-07.
+ *
+ * Only ever upgrades. A verdict is never downgraded here.
+ */
+export async function markTrackedLegit(chain: string, address: string): Promise<boolean> {
+  const redis = getRedis();
+  if (!redis) return false;
+  try {
+    const raw = await redis.get(key(chain, address));
+    if (!raw) return false;
+    const info = JSON.parse(raw) as TrackedInfo;
+    if (info.verdict === 'legit') return true;
+    info.verdict = 'legit';
+    info.verdictRule = 'owner-approved';
+    const ttl = await redis.ttl(key(chain, address));
+    await redis.set(key(chain, address), JSON.stringify(info), 'EX', ttl > 0 ? ttl : TTL_SECONDS);
+    return true;
+  } catch (err: any) {
+    console.error('[trackedDistributors] markTrackedLegit failed:', err?.message || err);
+    return false;
+  }
+}

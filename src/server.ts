@@ -22,6 +22,7 @@ import { addFactory, listFactories } from './store/factories.js';
 import { startPoller, isShadow } from './poller/index.js';
 import { breakerStatus, resetBreaker, answerCallback, editOwnerMarkup, OWNER_CHAT_ID } from './telegram.js';
 import { takePending } from './filter/pendingApproval.js';
+import { markTrackedLegit } from './store/trackedDistributors.js';
 // Solana support was removed 2026-08-05 (product decision: we do not track that network).
 // The poller, its RPC/metadata helpers and @solana/web3.js are gone; 'solana' is no longer
 // an accepted admin chain, so a stray /admin/factory {chain:"solana"} cannot resurrect it.
@@ -407,6 +408,13 @@ app.post('/tg/callback/:secret', express.json(), async (req: Request, res: Respo
 
     // Approve. The automatic path already claimed this dedupe key before withholding, so
     // publishing here cannot race a later automatic post of the same event.
+    //
+    // Approving a DEPOSIT also promotes the distributor to legit, so its later setTime goes
+    // straight to the channel instead of coming back here for a second approval.
+    if (rec.kind === 'deposit' && rec.distributor) {
+      const promoted = await markTrackedLegit(rec.chain, rec.distributor);
+      console.log('[approve] verdict promotion for %s %s: %s', rec.chain, rec.distributor, promoted ? 'ok' : 'record not found');
+    }
     await sendTelegram(rec.message);
     await answerCallback(cq.id, "Posted to channel");
     if (msgId) await editOwnerMarkup(msgId, "\u2705 posted to channel");

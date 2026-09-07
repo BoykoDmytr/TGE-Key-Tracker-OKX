@@ -104,11 +104,18 @@ const DEFAULT_STABLES: Record<string, string[]> = {
  * all (see filterAppliesTo). Anything not on the list goes to the owner for one tap —
  * never silently dropped.
  */
+// X Layer carries BOTH a native and a bridged deployment of USDC and USDT, at different
+// addresses with the same symbol. Listing only one variant is what let a real 300,000 USDC
+// campaign (0xb6ceceab…, native) fall through to the owner on 2026-09-07 — the bridged USDC
+// was allowlisted, the native one was not. All five verified against the OKX market API:
+// each prices at ~1.00 with real liquidity.
 const DEFAULT_ALLOWLIST: Record<string, string[]> = {
   xlayer: [
-    '0x779ded0c9e1022225f8e0630b35a9b54be713736', // USD₮0 — 6 of the 8 legit deposits
-    '0x4ae46a509f6b1d9056937ba4500cb143933d2dc8', // USDG  — RWA season competitions
-    '0x74b7f16337b8972027f6196a17a631ac6de26d22', // USDC
+    '0x779ded0c9e1022225f8e0630b35a9b54be713736', // USD₮0  — $21.8M liq, 6 of 8 historic legit deposits
+    '0x4ae46a509f6b1d9056937ba4500cb143933d2dc8', // USDG   — $18.6M liq, RWA season competitions
+    '0xb6ceceab302e2e4948951ee7843fc24e92933061', // USDC   — native,  $8.5M liq
+    '0x74b7f16337b8972027f6196a17a631ac6de26d22', // USDC   — bridged, $62k liq
+    '0x1e4a5963abfd975d8c9021ce480b42188849d41d', // USDT   — bridged, $572k liq
   ],
 };
 
