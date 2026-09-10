@@ -16,8 +16,14 @@ primary_region = 'arn'
   min_machines_running = 1
   processes = ['app']
 
+# 4 shared vCPUs, not 1. A shared-cpu machine gets a SUSTAINED slice of about 6.25% of a
+# core per vCPU, plus burst credit. On 2026-09-10 one vCPU measured 5.7% while the poller
+# was catching up (93% on the idle sister machine), and BSC could only be scanned at 3.3
+# blocks per second against the 2.2 the chain produces — a 50% margin, which is what let a
+# 3.5 hour backlog build in the first place. Four vCPUs cost $2.08/month more and turn that
+# into roughly a 6x margin.
 [[vm]]
   memory = '1gb'
   cpu_kind = 'shared'
-  cpus = 1
+  cpus = 4
   memory_mb = 1024
