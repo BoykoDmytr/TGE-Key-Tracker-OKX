@@ -37,7 +37,14 @@ function rpcsFor(chain: ChainKey): string[] {
   // fetching would burn that quota. Add it via POLLER_RPCS_<CHAIN> if you want it.
   const fromEnv = (process.env[`POLLER_RPCS_${upper}`] || '')
     .split(',').map((s) => s.trim()).filter(Boolean);
-  const list = [...fromEnv, ...(DEFAULT_RPCS[chain] || [])];
+  // When POLLER_RPCS_<CHAIN> is set it REPLACES the defaults rather than merely leading
+  // them, so a bad endpoint can be taken OUT of the pool from env, with no deploy.
+  // On 2026-09-10 publicnode began answering 403 to this machine on every request for
+  // bsc/base/arbitrum while sitting first in all three default pools. Each block then
+  // cost two dead round trips and a fresh TLS handshake; the connection churn made the
+  // whole machine 20x slower at every destination, including ones we never poll, and
+  // the poller fell a day behind on the two chains with the highest block rate.
+  const list = fromEnv.length ? fromEnv : (DEFAULT_RPCS[chain] || []);
   return [...new Set(list)];
 }
 
@@ -53,7 +60,12 @@ export function getPollerClient(chain: ChainKey): any {
   const client = createPublicClient({
     chain: CHAIN[chain],
     transport: fallback(
-      urls.map((u) => http(u, { timeout: 8000, retryCount: 1 })),
+      // retryCount 0 on purpose: inside a fallback pool, retrying the SAME endpoint is
+      // wasted work — the pool already gives redundancy across independent providers,
+      // and against an endpoint that hard-fails (403/429) the retry doubles the cost of
+      // every single block. A transient blip still costs nothing: fetchBlock returns
+      // null, the cursor holds before the gap, and the next tick re-reads that block.
+      urls.map((u) => http(u, { timeout: 8000, retryCount: 0 })),
       { rank: false }, // try in listed order; rotate on failure
     ),
   });

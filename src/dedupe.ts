@@ -18,9 +18,12 @@ function memIsDup(key: string): boolean {
   }
   return true;
 }
-function memMark(key: string): void {
+// ttlSec is honoured here too. It used to be ignored in favour of the 7-day constant,
+// which silently turned the poller's 6h lag-alert cooldown into a 7-day one on any
+// machine running without Redis — the alert would fire once and then go quiet for a week.
+function memMark(key: string, ttlSec: number = TTL_SEC): void {
   const now = Date.now();
-  seen.set(key, now + TTL_MS);
+  seen.set(key, now + ttlSec * 1000);
   if (seen.size > 5000) {
     for (const [k, exp] of seen) if (exp < now) seen.delete(k);
   }
@@ -42,7 +45,7 @@ export async function claimOnce(key: string, ttlSec: number = TTL_SEC): Promise<
     // without Redis the "exactly once" guarantee does not survive a restart.
     console.warn('[dedupe] NO REDIS — claim is in-memory only, not restart-safe:', key);
     if (memIsDup(key)) return false;
-    memMark(key);
+    memMark(key, ttlSec);
     return true;
   }
   try {
@@ -51,7 +54,7 @@ export async function claimOnce(key: string, ttlSec: number = TTL_SEC): Promise<
   } catch (err: any) {
     console.error('[dedupe] claimOnce redis error, falling back to memory:', err?.message || err);
     if (memIsDup(key)) return false;
-    memMark(key);
+    memMark(key, ttlSec);
     return true;
   }
 }
@@ -78,5 +81,24 @@ export async function markDuplicate(key: string): Promise<void> {
   } catch (err: any) {
     console.error('[dedupe] markDuplicate redis error, falling back:', err?.message || err);
     memMark(key);
+  }
+}
+
+/**
+ * Drop a claim before its TTL expires.
+ *
+ * ONLY for cooldown-style keys such as pollerlag:<chain>, where the claim means "the
+ * owner has already been told about THIS episode". Never call it on a message dedupe
+ * key: there a claim means "attempted exactly once", and releasing it is precisely how
+ * a re-post gets back into the channel.
+ */
+export async function releaseClaim(key: string): Promise<void> {
+  seen.delete(key);
+  const redis = getRedis();
+  if (!redis) return;
+  try {
+    await redis.del(`tge:dedup:${key}`);
+  } catch (err: any) {
+    console.error('[dedupe] releaseClaim redis error:', err?.message || err);
   }
 }

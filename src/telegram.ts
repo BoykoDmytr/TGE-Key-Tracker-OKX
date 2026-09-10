@@ -93,11 +93,16 @@ async function postMessage(chatId: string, text: string, silent: boolean, replyM
 }
 
 /** Notify the owner directly. Never throws, never touches the channel, never queued. */
-export async function notifyOwner(text: string): Promise<void> {
+/** Returns whether the DM actually landed. Still never throws, so every existing
+ *  `void notifyOwner(...)` caller is unaffected. The poller needs the answer: it must
+ *  not burn a 6-hour alert cooldown on a message Telegram never delivered. */
+export async function notifyOwner(text: string): Promise<boolean> {
   try {
     await postMessage(OWNER_CHAT_ID, text, true);
+    return true;
   } catch (e: any) {
     console.error('[telegram] owner DM failed:', e?.message || e);
+    return false;
   }
 }
 

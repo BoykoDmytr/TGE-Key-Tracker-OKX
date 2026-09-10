@@ -263,7 +263,7 @@ export async function processDepositTx(
       if (seenInTx.has(pairKey)) continue;
       seenInTx.add(pairKey);
 
-      const meta = await getErc20MetaCached(client, ev.token);
+      const meta = await getErc20MetaCached(client, ev.token, chainKey);
 
       // Amount: what actually LANDED beats what was declared. Tax/reflection tokens skim
       // on transfer (DOG declared 20000, only 19800 reached the distributor).
@@ -310,17 +310,30 @@ export async function processDepositTx(
       // real distributor, and if it is missing from the allowlist its future setTime is
       // silently dropped. (The old code `continue`d past addTracked on every filter.)
       if (opts.persist) {
-        await addTracked(chainKey, ev.distributor, {
-          depositTxHash: txHash,
-          addedAt: opts.blockTimestamp || Math.floor(Date.now() / 1000),
-          tokenAddress: ev.token,
-          tokenSymbol: meta.symbol,
-          amountHuman,
-          // The verdict rides on the record so the later setTime inherits it. Only
-          // 'enforce' writes a real verdict; off/shadow keep 'legit' = no change.
-          verdict: mode === 'enforce' ? verdict : 'legit',
-          verdictRule: vRule,
-        });
+        // A degraded re-read must never overwrite a good record. The same transaction can
+        // be seen twice (Tenderly webhook, then the poller). If the second read lost
+        // symbol or decimals, the first read's real values are strictly better than
+        // replacing them with guesses that a setTime would publish months later.
+        const prevTracked = meta.degraded ? await getTracked(chainKey, ev.distributor) : null;
+        if (prevTracked && !prevTracked.metaDegraded) {
+          console.error('[handler] %s %s: keeping the existing good metadata for %s', chainKey, txHash, ev.distributor);
+        } else {
+          await addTracked(chainKey, ev.distributor, {
+            depositTxHash: txHash,
+            addedAt: opts.blockTimestamp || Math.floor(Date.now() / 1000),
+            tokenAddress: ev.token,
+            tokenSymbol: meta.symbol,
+            amountHuman,
+            // The verdict rides on the record so the later setTime inherits it. Only
+            // 'enforce' writes a real verdict; off/shadow keep 'legit' = no change.
+            verdict: mode === 'enforce' ? verdict : 'legit',
+            verdictRule: vRule,
+            // Carry the warning onto the record. Without it the later setTime message,
+            // which only ever reads this record and never re-reads the token, would
+            // publish a guessed ticker and an amount from guessed decimals.
+            ...(meta.degraded ? { metaDegraded: true } : {}),
+          });
+        }
         tracked++;
         // Count this creator only AFTER classifying, so a deposit never counts itself.
         await noteCreator(ev.creator, chainKey, ev.distributor);
@@ -332,6 +345,28 @@ export async function processDepositTx(
 
       if (raw == null) {
         logInfo(opts.log, { chainKey, distributor: ev.distributor, txHash }, 'amount unknown, tracked but not posted');
+        continue;
+      }
+
+      // Token metadata is a placeholder: the eth_call for symbol or decimals failed. The
+      // distributor is tracked above (its setTime still posts, without the token line), but
+      // an amount computed from guessed decimals under a $UNKNOWN ticker must never reach
+      // the channel. Deliberately placed BELOW the two gates that need no metadata, so an
+      // eth_call outage cannot produce owner DMs about deposits we would have ignored.
+      if (meta.degraded) {
+        console.error('[handler] %s %s: degraded token metadata for %s — tracked, not posted', chainKey, txHash, ev.token);
+        // One DM per transaction, not per event: a single tx can carry dozens of events
+        // and the owner DM is unqueued.
+        if (await claimOnce(`metadeg:${chainKey}:${txHash.toLowerCase()}`, 6 * 3600)) {
+          void notifyOwner(
+            '\u26A0\uFE0F <b>Token metadata unreadable</b>' + '\n\n' +
+            'Chain: ' + chainKey + '\n' + 'Token: ' + ev.token + '\n' + 'Tx: ' + txHash + '\n\n' +
+            'The deposit was TRACKED, so its setTime will still be posted, but without the' +
+            ' token line. The deposit itself was NOT published: symbol/decimals could not be' +
+            ' read, so the amount would have been wrong.' + '\n\n' +
+            'If the token is real, post it by hand and clear metaDegraded on the tracked record.',
+          );
+        }
         continue;
       }
 

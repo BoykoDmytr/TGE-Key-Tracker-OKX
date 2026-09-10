@@ -19,6 +19,10 @@ export interface TrackedInfo {
   verdict?: 'legit' | 'spam' | 'unsure';
   /** Rule id behind the verdict — shown in the owner DM and kept for audit. */
   verdictRule?: string;
+  /** true === symbol/decimals were placeholders when this record was written, so
+   *  tokenSymbol and amountHuman are guesses. The setTime message renders without them
+   *  rather than publishing a wrong number to the channel months later. */
+  metaDegraded?: boolean;
 }
 
 /** Records with no verdict pre-date the filter and were already posted, so their setTime

@@ -19,7 +19,7 @@ import { formatSetTimeMessage } from './telegram/formatSetTime.js';
 
 import { processSetTimeTx, processDepositTx } from './handlers.js';
 import { addFactory, listFactories } from './store/factories.js';
-import { startPoller, isShadow } from './poller/index.js';
+import { startPoller, isShadow, pollerStatus } from './poller/index.js';
 import { breakerStatus, resetBreaker, answerCallback, editOwnerMarkup, OWNER_CHAT_ID } from './telegram.js';
 import { takePending } from './filter/pendingApproval.js';
 import { markTrackedLegit } from './store/trackedDistributors.js';
@@ -351,6 +351,16 @@ app.post('/admin/factory', express.json(), async (req: Request, res: Response) =
     (req as any).log?.error?.({ err: err?.message || err }, 'admin factory error');
     return res.status(500).send('error');
   }
+});
+
+// Per-chain poller lag, so a degradation can be checked from anywhere instead of by
+// SSHing into the machine and reading Redis by hand.
+app.get('/admin/lag', (req: Request, res: Response) => {
+  const secret = req.header('x-admin-secret') || '';
+  if (!process.env.ADMIN_SECRET || secret !== process.env.ADMIN_SECRET) {
+    return res.status(401).send('unauthorized');
+  }
+  return res.json(pollerStatus());
 });
 
 app.get('/admin/factory', async (req: Request, res: Response) => {

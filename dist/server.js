@@ -3,15 +3,22 @@ import 'dotenv/config';
 import express from 'express';
 import * as pinoHttpNS from 'pino-http';
 import { verifyTenderlySignature } from './tenderly/verify.js';
-import { extractTransfersFromReceipt } from './tenderly/parseTransfers.js';
-import { getPublicClient, getExplorerTxUrl } from './evm/provider.js';
-import { getErc20MetaCached, formatUnitsSafe } from './evm/erc20MetaCache.js';
-import { isDuplicate, markDuplicate } from './dedupe.js';
+import { getPublicClient } from './evm/provider.js';
 import { sendTelegram } from './telegram.js';
-import { formatNumberWithCommas } from './utils/formatNumberWithCommas.js';
-import { addTracked, getTracked } from './store/trackedDistributors.js';
-import { decodeSetTime } from './evm/decodeSetTime.js';
-import { formatSetTimeMessage } from './telegram/formatSetTime.js';
+import { addTracked } from './store/trackedDistributors.js';
+import { processSetTimeTx, processDepositTx } from './handlers.js';
+import { addFactory, listFactories } from './store/factories.js';
+import { startPoller, isShadow, pollerStatus } from './poller/index.js';
+import { breakerStatus, resetBreaker, answerCallback, editOwnerMarkup, OWNER_CHAT_ID } from './telegram.js';
+import { takePending } from './filter/pendingApproval.js';
+import { markTrackedLegit } from './store/trackedDistributors.js';
+// Solana support was removed 2026-08-05 (product decision: we do not track that network).
+// The poller, its RPC/metadata helpers and @solana/web3.js are gone; 'solana' is no longer
+// an accepted admin chain, so a stray /admin/factory {chain:"solana"} cannot resurrect it.
+function normalizeAdminChain(net) {
+    const n = String(net).toLowerCase().trim();
+    return normalizeTenderlyNetwork(n);
+}
 const app = express();
 // ✅ GLOBAL MIN AMOUNT FILTER (tokens)
 const MIN_TOKEN_AMOUNT = 5000;
@@ -147,129 +154,15 @@ app.post('/webhooks/tenderly', express.raw({ type: 'application/json' }), async 
             req.log.info({ txTo: tx?.to || null, interactionAddr }, 'tx.to != INTERACTION_CONTRACT (not our interaction) - ignored');
             return res.status(200).send('ok');
         }
-        // Receipt + transfers
-        req.log.info({ txHash }, 'fetching receipt');
-        const receipt = await client.getTransactionReceipt({ hash: txHash });
-        req.log.info({
-            logsCount: receipt?.logs?.length ?? 0,
-            status: receipt?.status,
-            blockNumber: receipt?.blockNumber?.toString?.() ?? receipt?.blockNumber,
-        }, 'receipt fetched');
-        const transfers = extractTransfersFromReceipt(receipt);
-        req.log.info({ transfersCount: transfers.length }, 'parsed transfers');
-        if (!transfers.length)
-            return res.status(200).send('ok');
-        // Thresholds / labels
-        const thresholds = safeJson(process.env.THRESHOLDS_JSON || '{}');
-        const thresholdsLower = {};
-        for (const [addr, human] of Object.entries(thresholds || {}))
-            thresholdsLower[addr.toLowerCase()] = String(human);
-        const strictMode = Object.keys(thresholdsLower).length > 0;
-        const tokenLabels = safeJson(process.env.TOKEN_LABELS_JSON || '{}');
-        const tokenLabelsLower = {};
-        for (const [addr, label] of Object.entries(tokenLabels || {}))
-            tokenLabelsLower[addr.toLowerCase()] = String(label);
-        req.log.info({
-            strictMode,
-            thresholdsKeys: Object.keys(thresholdsLower).slice(0, 20),
-            labelsKeys: Object.keys(tokenLabelsLower).slice(0, 20),
-        }, 'loaded thresholds/labels');
-        // Process transfers
-        let sentCount = 0;
-        for (const t of transfers) {
-            const tokenAddrLower = t.token.toLowerCase();
-            const threshHuman = thresholdsLower[tokenAddrLower] ?? null;
-            req.log.info({
-                token: t.token,
-                from: t.from,
-                to: t.to,
-                logIndex: t.logIndex,
-                value: t.value.toString(),
-                hasThreshold: Boolean(threshHuman),
-                threshold: threshHuman,
-            }, 'transfer candidate');
-            // strict mode: only tokens in thresholds
-            if (strictMode && !threshHuman) {
-                req.log.info({ token: t.token }, 'skip: token not in thresholds (strictMode)');
-                continue;
-            }
-            const dedupeKey = `${chainKey}:${txHash}:${t.logIndex}:${tokenAddrLower}:${t.to.toLowerCase()}`;
-            const dup = await isDuplicate(dedupeKey);
-            req.log.info({ dedupeKey, dup }, 'dedupe check');
-            if (dup)
-                continue;
-            // meta
-            req.log.info({ token: t.token }, 'fetching token meta');
-            const meta = await getErc20MetaCached(client, t.token);
-            const amountHuman = formatUnitsSafe(t.value, meta.decimals);
-            // ✅ GLOBAL FILTER: skip if amount < 5000 tokens
-            const amountNum = Number(amountHuman);
-            if (!Number.isNaN(amountNum) && amountNum < MIN_TOKEN_AMOUNT) {
-                req.log.info({ amountHuman, MIN_TOKEN_AMOUNT }, 'skip: amount below global minimum');
-                continue;
-            }
-            function compareHuman(amount, threshold) {
-                const a = Number(amount);
-                const b = Number(threshold);
-                if (Number.isNaN(a) || Number.isNaN(b))
-                    return false;
-                return a >= b;
-            }
-            // threshold compare: if there is a per-token threshold -> enforce it, else allow (non-strict)
-            const pass = threshHuman ? compareHuman(amountHuman, String(threshHuman)) : true;
-            req.log.info({
-                token: t.token,
-                symbol: meta.symbol,
-                decimals: meta.decimals,
-                amountHuman,
-                threshold: threshHuman,
-                pass,
-            }, 'meta + amount');
-            if (!pass)
-                continue;
-            const explorer = getExplorerTxUrl(chainKey, txHash);
-            // красиве ім’я мережі без underscore (щоб не ламало Markdown)
-            const networkPretty = chainKey === 'bsc_testnet' ? 'BSC Testnet' :
-                chainKey === 'bsc' ? 'BSC' :
-                    chainKey === 'base' ? 'Base' :
-                        chainKey === 'arbitrum' ? 'Arbitrum' :
-                            chainKey === 'ethereum' ? 'Ethereum' : // нове
-                                chainKey === 'avalanche' ? 'Avalanche' : // нове
-                                    chainKey === 'optimism' ? 'Optimism' : // нове
-                                        chainKey;
-            const label = tokenLabelsLower[tokenAddrLower] || meta.symbol;
-            const amountLine = `${formatNumberWithCommas(amountHuman)} $${label}`;
-            // ✅ MESSAGE EXACT FORMAT (MarkdownV2 + quote + link)
-            // IMPORTANT: sendTelegram must use parse_mode: 'MarkdownV2'
-            function escHtml(s) {
-                return s
-                    .replace(/&/g, '&amp;')
-                    .replace(/</g, '&lt;')
-                    .replace(/>/g, '&gt;')
-                    .replace(/"/g, '&quot;')
-                    .replace(/'/g, '&#39;');
-            }
-            const message = `⚡ <b>${escHtml('NEW OKX DEPOSIT DETECTED')}</b>\n\n` +
-                `Amount: ${escHtml(amountLine)}\n` +
-                `Network: ${escHtml(networkPretty)}\n` +
-                `<a href="${escHtml(explorer)}">${escHtml('View on Scan')}</a>\n\n` +
-                `<a href="https://t.me/cryptohornettg/1354">Refback 45%</a>`;
-            req.log.info({ messagePreview: message.slice(0, 200) }, 'sending telegram');
-            await sendTelegram(message);
-            sentCount++;
-            // Remember the new Distributor address in the allowlist for setTime
-            await addTracked(chainKey, t.to, {
-                depositTxHash: txHash,
-                addedAt: Math.floor(Date.now() / 1000),
-                tokenAddress: t.token,
-                tokenSymbol: meta.symbol,
-                amountHuman,
-            });
-            req.log.info({ chainKey, distributor: t.to }, 'added to setTime allowlist');
-            await markDuplicate(dedupeKey);
-            req.log.info({ dedupeKey }, 'marked duplicate');
-        }
-        req.log.info({ sentCount, ms: Date.now() - startedAt }, 'webhook processed');
+        // Process deposit via the shared handler. notify honours shadow mode — previously this
+        // was hardcoded true, so POLLER_SHADOW=1 muted the poller but NOT this route.
+        const { sent, tracked } = await processDepositTx(chainKey, txHash, client, {
+            notify: !isShadow(chainKey),
+            persist: true,
+            source: 'webhook',
+            log: req.log,
+        });
+        req.log.info({ sent, tracked, ms: Date.now() - startedAt }, 'webhook processed');
         return res.status(200).send('ok');
     }
     catch (err) {
@@ -278,7 +171,10 @@ app.post('/webhooks/tenderly', express.raw({ type: 'application/json' }), async 
             stack: err?.stack,
             ms: Date.now() - startedAt,
         }, 'Error handling webhook');
-        return res.status(500).send('error');
+        // 200 on purpose: a 500 makes the sender retry, which re-fetches the receipt and
+        // re-walks it. During an incident every call 500s and every retry compounds the
+        // flood. The poller re-scans the same blocks anyway, so nothing is truly lost.
+        return res.status(200).send('error-logged');
     }
 });
 // ====== SETTIME WEBHOOK (Tenderly Web3 Action -> Distributor.setTime) ======
@@ -296,38 +192,14 @@ app.post('/webhooks/settime', express.json(), async (req, res) => {
         const chainKey = normalizeTenderlyNetwork(String(network));
         if (!chainKey)
             return res.status(200).send('unsupported network');
-        // 2. Decode selector + 2×uint256
-        const decoded = decodeSetTime(String(input));
-        if (!decoded) {
-            req.log.info({ tx_hash }, 'not a setTime call');
-            return res.status(200).send('ok');
-        }
-        // 3. Allowlist filter — only Distributors that already passed a deposit alert
-        const tracked = await getTracked(chainKey, String(to));
-        if (!tracked) {
-            req.log.info({ chainKey, to, tx_hash }, 'setTime for non-tracked distributor, skipping');
-            return res.status(200).send('ok');
-        }
-        // 4. Dedupe
-        const dedupeKey = `settime:${chainKey}:${tx_hash}`;
-        if (await isDuplicate(dedupeKey))
-            return res.status(200).send('ok');
-        // 5. Format + send
-        const message = formatSetTimeMessage({
-            chainKey,
-            tracked,
-            startTime: decoded.startTime,
-            duration: decoded.duration,
-            txHash: String(tx_hash),
-        });
-        await sendTelegram(message);
-        await markDuplicate(dedupeKey);
-        req.log.info({ chainKey, to, tx_hash }, 'setTime notification sent');
+        // Decode + allowlist + dedup + send via shared handler (same path the poller uses).
+        const r = await processSetTimeTx({ chainKey, txHash: String(tx_hash), to: String(to), input: String(input) }, { notify: !isShadow(chainKey), source: 'webhook', log: req.log });
+        req.log.info({ chainKey, to, tx_hash, result: r }, 'settime processed');
         return res.status(200).send('ok');
     }
     catch (err) {
         req.log?.error?.({ err: err?.message || err }, 'settime webhook error');
-        return res.status(500).send('error');
+        return res.status(200).send('error-logged'); // see the deposit route: no retry amplification
     }
 });
 // ====== ADMIN: manual allowlist backfill ======
@@ -348,7 +220,7 @@ app.post('/admin/tracked', express.json(), async (req, res) => {
                     results.push({ chain: it?.chain || '', address: it?.address || '', ok: false, err: 'missing chain/address' });
                     continue;
                 }
-                const chainKey = normalizeTenderlyNetwork(String(it.chain));
+                const chainKey = normalizeAdminChain(String(it.chain));
                 if (!chainKey) {
                     results.push({ chain: it.chain, address: it.address, ok: false, err: 'unsupported chain' });
                     continue;
@@ -375,9 +247,151 @@ app.post('/admin/tracked', express.json(), async (req, res) => {
         return res.status(500).send('error');
     }
 });
+// ====== ADMIN: manage watched factory addresses (for the block poller) ======
+app.post('/admin/factory', express.json(), async (req, res) => {
+    try {
+        const secret = req.header('x-admin-secret') || '';
+        if (!process.env.ADMIN_SECRET || secret !== process.env.ADMIN_SECRET) {
+            return res.status(401).send('unauthorized');
+        }
+        const items = Array.isArray(req.body) ? req.body : [req.body];
+        if (!items.length)
+            return res.status(400).send('empty body');
+        const results = [];
+        for (const it of items) {
+            try {
+                if (!it || !it.chain || !it.address) {
+                    results.push({ chain: it?.chain || '', address: it?.address || '', ok: false, err: 'missing chain/address' });
+                    continue;
+                }
+                const chainKey = normalizeAdminChain(String(it.chain));
+                if (!chainKey) {
+                    results.push({ chain: it.chain, address: it.address, ok: false, err: 'unsupported chain' });
+                    continue;
+                }
+                await addFactory(chainKey, String(it.address));
+                results.push({ chain: chainKey, address: String(it.address).toLowerCase(), ok: true });
+            }
+            catch (e) {
+                results.push({ chain: it?.chain || '', address: it?.address || '', ok: false, err: e?.message || String(e) });
+            }
+        }
+        const added = results.filter((r) => r.ok).length;
+        req.log.info({ added, total: items.length }, 'admin factory updated');
+        return res.json({ added, total: items.length, results });
+    }
+    catch (err) {
+        req.log?.error?.({ err: err?.message || err }, 'admin factory error');
+        return res.status(500).send('error');
+    }
+});
+// Per-chain poller lag, so a degradation can be checked from anywhere instead of by
+// SSHing into the machine and reading Redis by hand.
+app.get('/admin/lag', (req, res) => {
+    const secret = req.header('x-admin-secret') || '';
+    if (!process.env.ADMIN_SECRET || secret !== process.env.ADMIN_SECRET) {
+        return res.status(401).send('unauthorized');
+    }
+    return res.json(pollerStatus());
+});
+app.get('/admin/factory', async (req, res) => {
+    const secret = req.header('x-admin-secret') || '';
+    if (!process.env.ADMIN_SECRET || secret !== process.env.ADMIN_SECRET) {
+        return res.status(401).send('unauthorized');
+    }
+    const chain = normalizeAdminChain(String(req.query.chain || ''));
+    if (!chain)
+        return res.status(400).send('bad/missing chain');
+    return res.json({ chain, factories: await listFactories(chain) });
+});
+// ====== Telegram callback: the owner approving a withheld post ======
+// Registered with setWebhook + a secret token. Three independent checks before anything
+// can reach the channel: the URL path secret, the Telegram secret-token header, and the
+// sender's Telegram user id. A withheld post is published only by the owner, by hand.
+app.post('/tg/callback/:secret', express.json(), async (req, res) => {
+    // Always 200: a non-200 makes Telegram retry the same update forever.
+    try {
+        const want = process.env.TG_WEBHOOK_SECRET || process.env.ADMIN_SECRET || "";
+        if (!want || req.params.secret !== want)
+            return res.status(200).send("ok");
+        const hdr = req.header("x-telegram-bot-api-secret-token") || "";
+        if (process.env.TG_WEBHOOK_SECRET && hdr !== process.env.TG_WEBHOOK_SECRET) {
+            return res.status(200).send("ok");
+        }
+        const cq = (req.body || {}).callback_query;
+        if (!cq)
+            return res.status(200).send("ok");
+        // Only the owner may publish. Anyone else tapping is ignored silently.
+        if (String(cq.from?.id || "") !== String(OWNER_CHAT_ID)) {
+            await answerCallback(cq.id, "Not authorised");
+            return res.status(200).send("ok");
+        }
+        const data = String(cq.data || "");
+        const msgId = cq.message?.message_id;
+        const m = /^(ap|no):([0-9a-f]{16})$/.exec(data);
+        if (!m) {
+            await answerCallback(cq.id, "Expired");
+            return res.status(200).send("ok");
+        }
+        const [, action, id] = m;
+        const rec = await takePending(id); // atomic: a second tap finds nothing
+        if (!rec) {
+            await answerCallback(cq.id, "Already handled or expired");
+            if (msgId)
+                await editOwnerMarkup(msgId, "\u2014 already handled");
+            return res.status(200).send("ok");
+        }
+        if (action === "no") {
+            await answerCallback(cq.id, "Discarded");
+            if (msgId)
+                await editOwnerMarkup(msgId, "\u{1F5D1} discarded");
+            console.log("[approve] discarded %s %s %s", rec.chain, rec.kind, rec.distributor);
+            return res.status(200).send("ok");
+        }
+        // Approve. The automatic path already claimed this dedupe key before withholding, so
+        // publishing here cannot race a later automatic post of the same event.
+        //
+        // Approving a DEPOSIT also promotes the distributor to legit, so its later setTime goes
+        // straight to the channel instead of coming back here for a second approval.
+        if (rec.kind === 'deposit' && rec.distributor) {
+            const promoted = await markTrackedLegit(rec.chain, rec.distributor);
+            console.log('[approve] verdict promotion for %s %s: %s', rec.chain, rec.distributor, promoted ? 'ok' : 'record not found');
+        }
+        await sendTelegram(rec.message);
+        await answerCallback(cq.id, "Posted to channel");
+        if (msgId)
+            await editOwnerMarkup(msgId, "\u2705 posted to channel");
+        console.log("[approve] published %s %s %s (rule %s)", rec.chain, rec.kind, rec.distributor, rec.rule);
+        return res.status(200).send("ok");
+    }
+    catch (err) {
+        console.error("[approve] callback failed:", err?.message || err);
+        return res.status(200).send("ok");
+    }
+});
+// ====== ADMIN: Telegram circuit breaker ======
+app.get('/admin/tg', (req, res) => {
+    const secret = req.header('x-admin-secret') || '';
+    if (!process.env.ADMIN_SECRET || secret !== process.env.ADMIN_SECRET) {
+        return res.status(401).send('unauthorized');
+    }
+    return res.json(breakerStatus());
+});
+app.post('/admin/tg/reset', (req, res) => {
+    const secret = req.header('x-admin-secret') || '';
+    if (!process.env.ADMIN_SECRET || secret !== process.env.ADMIN_SECRET) {
+        return res.status(401).send('unauthorized');
+    }
+    resetBreaker();
+    return res.json({ ok: true, status: breakerStatus() });
+});
 // ====== START ======
+console.log('[boot] POLLER_ENABLED=%s POLLER_SHADOW=%s POLLER_SHADOW_CHAINS=%s POLLER_CHAINS=%s FACTORIES_DEFAULT=%s', process.env.POLLER_ENABLED || '0', process.env.POLLER_SHADOW || '0', process.env.POLLER_SHADOW_CHAINS || '(none)', process.env.POLLER_CHAINS || process.env.CHAINS || '(none)', process.env.FACTORIES_DEFAULT ? '(set)' : '(not set)');
 const port = Number(process.env.PORT || 8080);
-app.listen(port, () => console.log(`Listening on :${port}`));
+app.listen(port, () => {
+    console.log(`Listening on :${port}`);
+    startPoller();
+});
 function normalizeTenderlyNetwork(net) {
     const n = String(net).toLowerCase().trim();
     // Chain ID формати
@@ -395,7 +409,11 @@ function normalizeTenderlyNetwork(net) {
         return 'avalanche'; // нове: Avalanche C‑Chain
     if (n === '10')
         return 'optimism'; // нове: Optimism
+    if (n === '196')
+        return 'xlayer'; // нове: X Layer (OKX zkEVM)
     // Текстові формати
+    if (n.includes('xlayer') || n.includes('x-layer') || n.includes('x layer'))
+        return 'xlayer';
     if (n.includes('bsc') && n.includes('test'))
         return 'bsc_testnet';
     if (n.includes('bsc') || n.includes('bnb'))

@@ -51,14 +51,20 @@ export interface FormatSetTimeArgs {
 export function formatSetTimeMessage(args: FormatSetTimeArgs): string {
   const { chainKey, tracked, startTime, txHash } = args;
 
-  const amount = tracked.amountHuman ? formatNumberWithCommas(tracked.amountHuman) : '';
-  const tokenLine = `${amount}${amount ? ' ' : ''}$${tracked.tokenSymbol}`.trim();
+  // A record written from a degraded metadata read carries a guessed ticker and an
+  // amount computed from guessed decimals. The claim time is the point of this message,
+  // so publish that and leave the token line out rather than putting a wrong number in
+  // front of subscribers.
+  const amount = tracked.metaDegraded ? '' : (tracked.amountHuman ? formatNumberWithCommas(tracked.amountHuman) : '');
+  const tokenLine = tracked.metaDegraded
+    ? ''
+    : `${amount}${amount ? ' ' : ''}$${tracked.tokenSymbol}`.trim();
 
   const explorer = getExplorerTxUrl(chainKey, txHash);
 
   return (
     `⏰ <b>${escHtml('NEW SET TIME')}</b>\n\n` +
-    `Token: ${escHtml(tokenLine)}\n` +
+    (tokenLine ? `Token: ${escHtml(tokenLine)}\n` : '') +
     `Network: ${escHtml(prettyNetwork(chainKey))}\n` +
     `Claim Time: ${escHtml(fmtUtcKyiv(startTime))}\n` +
     `<a href="${escHtml(explorer)}">${escHtml('View on Scan')}</a>\n\n` +

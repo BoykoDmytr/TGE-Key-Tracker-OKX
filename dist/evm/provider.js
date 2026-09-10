@@ -1,6 +1,6 @@
 // src/evm/provider.ts
 import { createPublicClient, http } from 'viem';
-import { bsc, bscTestnet, base, arbitrum, mainnet, avalanche, optimism } from 'viem/chains';
+import { bsc, bscTestnet, base, arbitrum, mainnet, avalanche, optimism, xLayer } from 'viem/chains';
 const RPC = {
     bsc: process.env.RPC_BSC || '',
     bsc_testnet: process.env.RPC_BSC_TESTNET || '',
@@ -9,6 +9,7 @@ const RPC = {
     ethereum: process.env.RPC_ETHEREUM || '',
     avalanche: process.env.RPC_AVALANCHE || '',
     optimism: process.env.RPC_OPTIMISM || '',
+    xlayer: process.env.RPC_XLAYER || '',
 };
 const CHAIN = {
     bsc,
@@ -18,6 +19,7 @@ const CHAIN = {
     ethereum: mainnet,
     avalanche,
     optimism,
+    xlayer: xLayer,
 };
 const clients = new Map();
 export function getPublicClient(chainKey) {
@@ -43,6 +45,7 @@ const DEFAULT_EXPLORERS = {
     ethereum: 'https://etherscan.io/tx/',
     avalanche: 'https://snowtrace.io/tx/',
     optimism: 'https://optimistic.etherscan.io/tx/',
+    xlayer: 'https://www.oklink.com/xlayer/tx/',
 };
 // Env var keys for each chain
 const EXPLORER_ENV_KEYS = {
@@ -53,6 +56,7 @@ const EXPLORER_ENV_KEYS = {
     ethereum: 'EXPLORER_ETHEREUM',
     avalanche: 'EXPLORER_AVALANCHE',
     optimism: 'EXPLORER_OPTIMISM',
+    xlayer: 'EXPLORER_XLAYER',
 };
 export function getExplorerTxUrl(chainKey, txHash) {
     const envKey = EXPLORER_ENV_KEYS[chainKey];

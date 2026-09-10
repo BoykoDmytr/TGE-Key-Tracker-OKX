@@ -1,6 +1,7 @@
 // src/telegram/formatSetTime.ts
 import { getExplorerTxUrl } from '../evm/provider.js';
 import { formatNumberWithCommas } from '../utils/formatNumberWithCommas.js';
+import { kyivTimeShort } from '../utils/kyivTime.js';
 function escHtml(s) {
     return s
         .replace(/&/g, '&amp;')
@@ -18,6 +19,7 @@ function prettyNetwork(chainKey) {
         case 'ethereum': return 'Ethereum';
         case 'avalanche': return 'Avalanche';
         case 'optimism': return 'Optimism';
+        case 'xlayer': return 'X Layer';
         default: return chainKey;
     }
 }
@@ -27,45 +29,25 @@ function fmtUtc(unix) {
     const d = new Date(unix * 1000);
     return `${pad(d.getUTCDate())}.${pad(d.getUTCMonth() + 1)}.${d.getUTCFullYear()} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())} UTC`;
 }
-// seconds -> "14d" / "14d 5h" / "5h" / "30m"
-function humanizeDuration(seconds) {
-    const d = Math.floor(seconds / 86400);
-    const h = Math.floor((seconds % 86400) / 3600);
-    const m = Math.floor((seconds % 3600) / 60);
-    const parts = [];
-    if (d > 0)
-        parts.push(`${d}d`);
-    if (h > 0)
-        parts.push(`${h}h`);
-    if (!parts.length)
-        parts.push(`${m}m`);
-    return parts.join(' ');
-}
-// relative to now -> "in 55d 23h" / "12h ago"
-function relFromNow(targetUnix) {
-    const now = Math.floor(Date.now() / 1000);
-    const diff = targetUnix - now;
-    const ahead = diff >= 0;
-    const abs = Math.abs(diff);
-    const d = Math.floor(abs / 86400);
-    const h = Math.floor((abs % 86400) / 3600);
-    const parts = [];
-    if (d > 0)
-        parts.push(`${d}d`);
-    parts.push(`${h}h`);
-    const body = parts.join(' ');
-    return ahead ? `in ${body}` : `${body} ago`;
+// "03.06.2026 14:00 UTC | 17:00 Kyiv"
+export function fmtUtcKyiv(unix) {
+    return `${fmtUtc(unix)} | ${kyivTimeShort(unix)}`;
 }
 export function formatSetTimeMessage(args) {
-    const { chainKey, tracked, startTime, duration, txHash } = args;
-    const endTime = startTime + duration;
-    const amount = tracked.amountHuman ? formatNumberWithCommas(tracked.amountHuman) : '';
-    const tokenLine = `${amount}${amount ? ' ' : ''}$${tracked.tokenSymbol}`.trim();
+    const { chainKey, tracked, startTime, txHash } = args;
+    // A record written from a degraded metadata read carries a guessed ticker and an
+    // amount computed from guessed decimals. The claim time is the point of this message,
+    // so publish that and leave the token line out rather than putting a wrong number in
+    // front of subscribers.
+    const amount = tracked.metaDegraded ? '' : (tracked.amountHuman ? formatNumberWithCommas(tracked.amountHuman) : '');
+    const tokenLine = tracked.metaDegraded
+        ? ''
+        : `${amount}${amount ? ' ' : ''}$${tracked.tokenSymbol}`.trim();
     const explorer = getExplorerTxUrl(chainKey, txHash);
     return (`⏰ <b>${escHtml('NEW SET TIME')}</b>\n\n` +
-        `Token: ${escHtml(tokenLine)}\n` +
+        (tokenLine ? `Token: ${escHtml(tokenLine)}\n` : '') +
         `Network: ${escHtml(prettyNetwork(chainKey))}\n` +
-        `Claim Time: ${escHtml(fmtUtc(startTime))} (${escHtml(relFromNow(startTime))})\n` +
+        `Claim Time: ${escHtml(fmtUtcKyiv(startTime))}\n` +
         `<a href="${escHtml(explorer)}">${escHtml('View on Scan')}</a>\n\n` +
         `<a href="https://t.me/cryptohornettg/1354">Refback 45%</a>`);
 }
